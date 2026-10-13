@@ -139,6 +139,22 @@ static int ggml_cuda_mmq_get_J_best(
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
+    // debug/tuning override: force a fixed tile width via GGML_CUDA_MMQ_J
+    static const int env_j = []() {
+        const char * e = getenv("GGML_CUDA_MMQ_J");
+        return e ? atoi(e) : 0;
+    }();
+    if (env_j >= 8 && env_j <= 128) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, env_j, fallback, cc, prec_src1);
+        if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+            if (nthreads_best) {
+                *nthreads_best = config.nthreads;
+            }
+            return env_j;
+        }
+        return 0;
+    }
+
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
         if (config.type == GGML_TYPE_COUNT) {
@@ -426,6 +442,17 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 
     if (!mmq_supported) {
         return false;
+    }
+
+    // debug/tuning override: force the MMQ path for all batch sizes via GGML_CUDA_MMQ_FORCE=1
+    {
+        static const bool env_force = []() {
+            const char * e = getenv("GGML_CUDA_MMQ_FORCE");
+            return e ? atoi(e) != 0 : false;
+        }();
+        if (env_force) {
+            return true;
+        }
     }
 
     // MMQ tiles require at least 48 KiB per-block shared memory; fall back to BLAS otherwise.
