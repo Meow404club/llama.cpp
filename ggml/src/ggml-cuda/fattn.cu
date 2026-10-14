@@ -544,6 +544,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_NONE;
 #endif// FLASH_ATTN_AVAILABLE
 
+    // debug/tuning override: force a flash-attention kernel via GGML_CUDA_FATTN_KERNEL
+    {
+        static const int env_k = []() {
+            const char * e = getenv("GGML_CUDA_FATTN_KERNEL");
+            if (!e) return 0;
+            if (!strcmp(e, "vec"))  return 1;
+            if (!strcmp(e, "tile")) return 2;
+            if (!strcmp(e, "mma"))  return 3;
+            return 0;
+        }();
+        if (env_k == 1) return BEST_FATTN_KERNEL_VEC;
+        if (env_k == 2) return BEST_FATTN_KERNEL_TILE;
+        if (env_k == 3) return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
     const ggml_tensor * KQV   = dst;
     const ggml_tensor * Q     = dst->src[0];
     const ggml_tensor * K     = dst->src[1];
