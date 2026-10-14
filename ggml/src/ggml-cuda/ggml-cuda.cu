@@ -1508,8 +1508,10 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     bool prefer_f32_output = false;
+    // meow: A/B toggle - force f32 GEMM output on RDNA3 (skips the f16 temp + convert pass)
+    static const bool hip_f32_out = (getenv("GGML_HIP_F32_OUT") != nullptr);
     if (compute_type == GGML_TYPE_F16) {
-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc) || hip_f32_out;
     } else if (compute_type == GGML_TYPE_BF16) {
         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
     }
@@ -4521,6 +4523,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// meow: set per graph_compute, consumed by the op profiler to count evals
+static bool ggml_prof_new_eval = false;
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4692,64 +4697,81 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 bool ok;
 
+                // meow: distortion-free op profiler. Instruments 1 eval per
+                // GGML_CUDA_PROFILE_EVERY (default 48) and drains the previous
+                // instrumented eval's events at the next one - by then the GPU has
+                // long passed them, so no synchronization ever stalls the pipeline.
                 static const bool prof_enabled = (getenv("GGML_CUDA_PROFILE") != nullptr) && !use_cuda_graph;
-                if (prof_enabled) {
-                    static std::vector<cudaEvent_t> prof_ev_start;
-                    static std::vector<cudaEvent_t> prof_ev_stop;
-                    static std::vector<int>        prof_executed;
-                    static std::unordered_map<ggml_op, double> prof_ms;
-                    static std::unordered_map<ggml_op, int>    prof_cnt;
-                    static int prof_calls = 0;
-
-                    if ((int) prof_ev_start.size() <= i) {
-                        prof_ev_start.resize(i + 1);
-                        prof_ev_stop.resize(i + 1);
-                    }
-                    if (prof_ev_start[i] == nullptr) {
-                        cudaEventCreateWithFlags(&prof_ev_start[i], 0);
-                        cudaEventCreateWithFlags(&prof_ev_stop[i], 0);
-                    }
-                    CUDA_CHECK(cudaEventRecord(prof_ev_start[i], cuda_ctx->stream()));
-                    ok = ggml_cuda_compute_forward(*cuda_ctx, node);
-                    CUDA_CHECK(cudaEventRecord(prof_ev_stop[i], cuda_ctx->stream()));
-                    prof_executed.push_back(i);
-
-                    // drain and accumulate once per full graph evaluation
-                    // (or early if the tail of the graph got fused away / large graphs)
-                    if (i + 1 == cgraph->n_nodes || prof_executed.size() >= 2048) {
-                        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
-                        for (int k : prof_executed) {
-                            ggml_op op = cgraph->nodes[k]->op;
+                static const int prof_every = []() {
+                    const char * e = getenv("GGML_CUDA_PROFILE_EVERY");
+                    return e ? std::max(1, atoi(e)) : 48;
+                }();
+                struct prof_state_t {
+                    std::vector<cudaEvent_t> ev_start, ev_stop;
+                    std::vector<std::pair<int, ggml_op>> pending; // node idx + op recorded last time
+                    std::unordered_map<ggml_op, double> ms;
+                    std::unordered_map<ggml_op, int>    cnt;
+                    long long evals = 0;       // all graph computes
+                    long long instr = 0;       // instrumented evals
+                    long long drained = 0;     // drained instrumented evals
+                };
+                static prof_state_t st;
+                static bool prof_new_eval_pending = false;
+                if (ggml_prof_new_eval) {
+                    ggml_prof_new_eval = false;
+                    st.evals++;
+                    prof_new_eval_pending = true;
+                }
+                const bool instr = prof_enabled && (st.evals % prof_every == 0);
+                if (instr) {
+                    // drain the previous instrumented eval once, at the first node
+                    if (prof_new_eval_pending) {
+                    prof_new_eval_pending = false;
+                    if (!st.pending.empty()) {
+                        for (auto & pr : st.pending) {
                             float ms = 0.0f;
-                            hipEventElapsedTime(&ms, prof_ev_start[k], prof_ev_stop[k]);
+                            hipEventElapsedTime(&ms, st.ev_start[pr.first], st.ev_stop[pr.first]);
                             if (ms >= 0.0f) {
-                                prof_ms[op] += ms;
-                                prof_cnt[op] += 1;
+                                st.ms[pr.second] += ms;
+                                st.cnt[pr.second] += 1;
                             }
                         }
-                        prof_executed.clear();
-
-                        static int prof_reports = 0;
-                        if (++prof_reports % 2 == 0) {
-                            fprintf(stderr, "[prof] cumulative op timing over %d evals (ms):\n", prof_reports);
+                        st.drained++;
+                        st.pending.clear();
+                        if (st.drained % 4 == 0) {
+                            fprintf(stderr, "[prof] op timing per eval, mean of %lld evals (ms):\n", st.drained);
                             std::vector<std::pair<double, ggml_op>> sorted;
-                            for (auto & kv : prof_ms) {
-                                sorted.push_back({kv.second, kv.first});
+                            for (auto & kv : st.ms) {
+                                sorted.push_back({kv.second / st.drained, kv.first});
                             }
                             std::sort(sorted.begin(), sorted.end(),
                                       [](const auto & a, const auto & b) { return a.first > b.first; });
                             double total = 0.0;
-                            for (auto & kv : sorted) {
-                                total += kv.second;
-                            }
+                            for (auto & kv : sorted) { total += kv.first; }
                             for (size_t k = 0; k < sorted.size() && k < 20; k++) {
-                                fprintf(stderr, "[prof]   %-24s total %9.2f ms  avg %7.4f ms  x %d\n",
+                                fprintf(stderr, "[prof]   %-24s %8.4f ms/eval  x %d  (%4.1f%%)\n",
                                         ggml_op_name(sorted[k].second), sorted[k].first,
-                                        sorted[k].first / std::max(1, prof_cnt[sorted[k].second]),
-                                        prof_cnt[sorted[k].second]);
+                                        st.cnt[sorted[k].second] / (int) st.drained,
+                                        100.0 * sorted[k].first / (total > 0 ? total : 1));
                             }
-                            fprintf(stderr, "[prof]   TOTAL %9.2f ms over %d evals\n", total, prof_reports);
+                            fprintf(stderr, "[prof]   %-24s %8.4f ms/eval\n", "TOTAL(sum)", total);
                         }
+                    }
+                    }
+                    if ((int) st.ev_start.size() <= i) {
+                        st.ev_start.resize(i + 1);
+                        st.ev_stop.resize(i + 1);
+                    }
+                    if (st.ev_start[i] == nullptr) {
+                        cudaEventCreateWithFlags(&st.ev_start[i], 0);
+                        cudaEventCreateWithFlags(&st.ev_stop[i], 0);
+                    }
+                    CUDA_CHECK(cudaEventRecord(st.ev_start[i], cuda_ctx->stream()));
+                    ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                    CUDA_CHECK(cudaEventRecord(st.ev_stop[i], cuda_ctx->stream()));
+                    st.pending.push_back({i, node->op});
+                    if (st.pending.size() == 1) {
+                        st.instr++;
                     }
                 } else {
                     ok = ggml_cuda_compute_forward(*cuda_ctx, node);
@@ -4911,6 +4933,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    ggml_prof_new_eval = true;
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
     return GGML_STATUS_SUCCESS;
