@@ -29,6 +29,7 @@ gated_delta_net_cuda(const float * q,
                                      const uint3   rq3_magic,
                                      float         scale,
                                      int64_t       state_slot_stride,
+                                     int64_t       cache_seq_stride, // meow: fused-cache write stride (0 = H*S_v*S_v)
                                      int           K) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
@@ -54,7 +55,9 @@ gated_delta_net_cuda(const float * q,
     // input state holds s0 only: [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
     // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
     const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
-    const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
+    const int64_t state_out_offset     = cache_seq_stride > 0
+        ? (int64_t) sequence * cache_seq_stride + h_idx * S_v * S_v
+        : (sequence * H + h_idx) * S_v * S_v;
     state += state_out_offset;
     curr_state += state_in_offset + col * S_v;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
@@ -185,7 +188,8 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
+        float scale, int64_t state_slot_stride, int K, cudaStream_t stream,
+        int64_t cache_seq_stride = 0) {
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     // four columns per warp (see the kernel); shrink the CTA when the wider CTA would leave
     // SMs without a CTA, so small head counts keep the device filled
@@ -215,24 +219,24 @@ static void launch_gated_delta_net(
                 ggml_cuda_kernel_launch(gated_delta_net_cuda<128, false, true, 2>, lp,
                     q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                     n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, cache_seq_stride, K);
             } else {
                 ggml_cuda_kernel_launch(gated_delta_net_cuda<128, false, false, 2>, lp,
                     q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                     n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, cache_seq_stride, K);
             }
         } else {
             if (keep_rs_t) {
                 ggml_cuda_kernel_launch(gated_delta_net_cuda<128, true, true, 2>, lp,
                     q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                     n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, cache_seq_stride, K);
             } else {
                 ggml_cuda_kernel_launch(gated_delta_net_cuda<128, true, false, 2>, lp,
                     q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                     n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, cache_seq_stride, K);
             }
         }
         return;
@@ -244,26 +248,26 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, cache_seq_stride, K);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, cache_seq_stride, K);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, cache_seq_stride, K);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, cache_seq_stride, K);
             break;
         }
         default:
@@ -884,9 +888,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
     float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
     int64_t state_slot_stride = S_v * S_v * H * n_seqs;
+    int64_t cache_seq_stride = 0;
     if (cache != nullptr) {
         state_d           = cache->data;
         state_slot_stride = cache->slot_stride;
+        cache_seq_stride  = cache->seq_stride;
     }
 
     // meow: chunked prefill path (WY representation) for long single-sequence

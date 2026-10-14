@@ -4,6 +4,7 @@
 // fused-kernel recurrent-state output; strides in elements (per-seq stride is always D, set in-kernel)
 struct ggml_cuda_gated_delta_net_fused_cache {
     float * data;        // rollback slot 0
+    int64_t seq_stride;  // per-sequence stride in floats (D, or D*slots with rollback capacity)
     int64_t slot_stride; // between rollback slots (0 when K==1)
 };
 
