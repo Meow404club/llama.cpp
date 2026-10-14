@@ -4730,7 +4730,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         prof_executed.clear();
 
                         static int prof_reports = 0;
-                        if (++prof_reports % 64 == 0) {
+                        if (++prof_reports % 2 == 0) {
                             fprintf(stderr, "[prof] cumulative op timing over %d evals (ms):\n", prof_reports);
                             std::vector<std::pair<double, ggml_op>> sorted;
                             for (auto & kv : prof_ms) {

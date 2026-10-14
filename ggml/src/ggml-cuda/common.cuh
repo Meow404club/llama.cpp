@@ -1533,12 +1533,22 @@ public:
     cudaStream_t stream() { return stream(device, curr_stream_no); }
 
     void synchronize() {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         // Multi-device execution retains its existing synchronization behavior.
-        if (ggml_cuda_info().device_count == 1 && !stream_used[device][curr_stream_no]) {
-            return;
+        // meow: also enabled for HIP, single-GPU only; env kill switch for A/B.
+        // Guard the skip with cudaStreamQuery so a missed stream_used mark
+        // (submission path that did not go through stream()) can never skip a
+        // needed sync - query is cheap, sync only happens when work is pending.
+        static const bool skip_disabled = (getenv("GGML_SYNC_SKIP") == nullptr); // meow: opt-in
+        if (!skip_disabled && ggml_cuda_info().device_count == 1 && !stream_used[device][curr_stream_no]) {
+            const cudaError_t qs = hipStreamQuery(streams[device][curr_stream_no]);
+            if (qs == cudaSuccess) {
+                return;
+            }
+            if (qs != hipErrorNotReady) {
+                CUDA_CHECK(qs);
+            }
+            (void) cudaGetLastError(); // clear the NotReady sticky probe
         }
-#endif
         CUDA_CHECK(cudaStreamSynchronize(stream()));
         stream_used[device][curr_stream_no] = false;
     }
