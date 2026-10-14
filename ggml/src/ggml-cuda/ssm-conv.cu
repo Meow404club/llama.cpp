@@ -7,7 +7,10 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
                                     const float * bias_ptr,
                                     const int src0_nb0, const int src0_nb1, const int src0_nb2, const int src1_nb1,
                                     float * dst_ptr, const int dst_nb0, const int dst_nb1, const int dst_nb2,
-                                    const int64_t n_t) {
+                                    const int64_t n_t,
+                                    const float * st_ptr, const int st_nb1, const int st_nb2, const int64_t st_cols,
+                                    const int st_cs, const int st_ls, const int x_cs, const int x_ls,
+                                    float * upd_ptr, const int upd_nb2) {
     ggml_cuda_pdl_lc();
     const float * GGML_CUDA_RESTRICT src0 = src0_ptr;
     const float * GGML_CUDA_RESTRICT src1 = src1_ptr;
@@ -22,9 +25,19 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
     const float * w_block = (const float *) ((const char *) src1 + bidy * split_d_inner * src1_nb1);
     float *       y_block = (float *) ((char *) dst + bidx * dst_nb2 + bidy * split_d_inner * dst_nb0);
 
-    const int stride_x = src0_nb1 / sizeof(float);
     const int stride_w = src1_nb1 / sizeof(float);
     const int stride_y = dst_nb1 / sizeof(float);
+
+    // meow: column c of channel tid comes from the state part or the x part;
+    // each part has its own (channel stride, column stride) so the transposed
+    // projection view and the state cache are both read in place.
+    const float * st_base = st_ptr ? (const float *) ((const char *) st_ptr + bidx * st_nb2 + bidy * split_d_inner * st_nb1) : nullptr;
+    const auto ldcol = [&](int64_t c) -> float {
+        if (st_base != nullptr && c < st_cols) {
+            return st_base[tid * st_cs + c * st_ls];
+        }
+        return x_block[tid * x_cs + (c - st_cols) * x_ls];
+    };
 
     float x[d_conv] = { 0.0f };
     float w[d_conv] = { 0.0f };
@@ -42,10 +55,10 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
 
         if (i == 0) {
             for (size_t j = 0; j < d_conv; j++) {
-                x[j] = x_block[tid * stride_x + j];
+                x[j] = ldcol(j);
             }
         } else {
-            x[(i - 1) % d_conv] = x_block[tid * stride_x + i + d_conv - 1];
+            x[(i - 1) % d_conv] = ldcol(i + d_conv - 1);
         }
 
 #pragma unroll
@@ -55,6 +68,15 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
         sumf += b;
         y_block[i * stride_y + tid] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
     }
+
+    if (upd_ptr != nullptr) {
+        // cache layout: element (col j, channel ch, seq s) at s*upd_nb2 + ch*st_cols + j
+        float * upd_base = (float *) ((char *) upd_ptr + bidx * upd_nb2);
+#pragma unroll
+        for (size_t j = 0; j + 1 < d_conv; j++) {
+            upd_base[(bidy * split_d_inner + tid) * st_cols + j] = ldcol(n_t + j);
+        }
+    }
 }
 
 template <bool apply_silu, size_t split_d_inner, size_t d_conv, int64_t split_n_t>
@@ -62,7 +84,10 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
                                                const float * __restrict__ bias,
                                                const int src0_nb0, const int src0_nb1, const int src0_nb2,
                                                const int src1_nb1, float * __restrict__ dst, const int dst_nb0,
-                                               const int dst_nb1, const int dst_nb2, const int64_t n_t) {
+                                               const int dst_nb1, const int dst_nb2, const int64_t n_t,
+                                               const float * st_ptr, const int st_nb1, const int st_nb2, const int64_t st_cols,
+                                               const int st_cs, const int st_ls, const int x_cs, const int x_ls,
+                                               float * upd_ptr, const int upd_nb2) {
     const int tid  = threadIdx.x;
     const int bidx = blockIdx.x;
     const int bidy = blockIdx.y;
@@ -70,13 +95,22 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
 
     const float * x_block = (const float *) ((const char *) src0 + bidx * src0_nb2 + bidy * split_d_inner * src0_nb1 +
                                              bidz * split_n_t * src0_nb0);
+    const float * st_block = st_ptr ? (const float *) ((const char *) st_ptr + bidx * st_nb2 + bidy * split_d_inner * st_nb1) : nullptr;
     const float * w_block = (const float *) ((const char *) src1 + bidy * split_d_inner * src1_nb1);
     float *       y_block =
         (float *) ((char *) dst + bidx * dst_nb2 + bidz * split_n_t * dst_nb1 + bidy * split_d_inner * dst_nb0);
 
-    const int stride_x = src0_nb1 / sizeof(float);
     const int stride_w = src1_nb1 / sizeof(float);
     const int stride_y = dst_nb1 / sizeof(float);
+
+    // meow: dual-source column load with per-part (channel, column) strides.
+    // c is LOCAL to this z-block's window; only block 0 can reach the state part.
+    const auto ldcol = [&](int row, int64_t c) -> float {
+        if (st_block != nullptr && bidz == 0 && c < st_cols) {
+            return st_block[row * st_cs + c * st_ls];
+        }
+        return x_block[row * x_cs + (c - st_cols) * x_ls];
+    };
 
     const int64_t local_n_t = min(split_n_t, n_t - bidz * split_n_t);
     const int     n_cols    = d_conv - 1 + split_n_t;
@@ -85,19 +119,15 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
 
     constexpr int load_cols   = d_conv - 1 + split_n_t;
     constexpr int total_elems = split_d_inner * load_cols;
-    int row = tid / load_cols;
-    int col = tid % load_cols;
 #pragma unroll
-    for (int idx = 0; idx < total_elems; idx += split_d_inner) {
-        if (row < (int)split_d_inner) {
-            smem[row * n_cols + col] = x_block[row * stride_x + col];
-        }
-
-        col += split_d_inner;
-        row += col / load_cols;
-        col  = col % load_cols;
-        if (idx >= total_elems - tid - split_d_inner) {
-            break;
+    // meow: enumerate channel-first so consecutive threads hit consecutive
+    // addresses in the (channel-contiguous) transposed x view; state columns
+    // are only 3 wide so their 12B stride costs little.
+    for (int idx = tid; idx < total_elems; idx += split_d_inner) {
+        const int lrow = idx % (int)split_d_inner;
+        const int lcol = idx / (int)split_d_inner;
+        if (lrow < (int)split_d_inner && lcol < n_cols) {
+            smem[lrow * n_cols + lcol] = ldcol(lrow, lcol);
         }
     }
     __syncthreads();
@@ -121,13 +151,31 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
         sumf += b;
         y_block[i * stride_y + tid] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
     }
+    if (upd_ptr != nullptr && bidz == gridDim.z - 1) {
+        // rolled state update: only the last z-block owns the final columns;
+        // rebias to the un-advanced x base for absolute column indexing.
+        // cache layout: element (col j, channel ch, seq s) at s*upd_nb2 + ch*st_cols + j
+        const float * x_glob = (const float *) ((const char *) x_block - (int64_t) bidz * split_n_t * src0_nb0);
+        float * upd_base = (float *) ((char *) upd_ptr + bidx * upd_nb2);
+#pragma unroll
+        for (size_t j = 0; j + 1 < d_conv; j++) {
+            const int64_t c = n_t + j;
+            const float v = (c < (int64_t) st_cols)
+                ? st_block[tid * st_cs + c * st_ls]
+                : x_glob[tid * x_cs + (c - st_cols) * x_ls];
+            upd_base[(bidy * split_d_inner + tid) * st_cols + j] = v;
+        }
+    }
 }
 
 template <bool apply_silu>
 static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
                               const int dst_nb2, const int64_t nc, const int64_t nr, const int64_t n_t,
-                              const int64_t n_s, cudaStream_t stream) {
+                              const int64_t n_s, cudaStream_t stream,
+                              const float * st, const int st_nb1, const int st_nb2, const int64_t st_cols,
+                              const int st_cs, const int st_ls, const int x_cs, const int x_ls,
+                              float * upd, const int upd_nb2) {
     const int threads = 128;
     GGML_ASSERT(nr % threads == 0);
 
@@ -137,13 +185,15 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
             const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
             ggml_cuda_kernel_launch(ssm_conv_f32<apply_silu, threads, kNC>, launch_params, src0, src1, bias, src0_nb0, src0_nb1,
-                                                                        src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
+                                                                        src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t,
+                                                                        st, st_nb1, st_nb2, st_cols, st_cs, st_ls, x_cs, x_ls, upd, upd_nb2);
         } else {
             const int64_t split_n_t = 32;
             dim3          blocks(n_s, (nr + threads - 1) / threads, (n_t + split_n_t - 1) / split_n_t);
             const size_t  smem_size = threads * (kNC - 1 + split_n_t) * sizeof(float);
             ssm_conv_long_token_f32<apply_silu, threads, kNC, split_n_t><<<blocks, threads, smem_size, stream>>>(
-                src0, src1, bias, src0_nb0, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
+                src0, src1, bias, src0_nb0, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t,
+                st, st_nb1, st_nb2, st_cols, st_cs, st_ls, x_cs, x_ls, upd, upd_nb2);
         }
     };
 
@@ -157,8 +207,14 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
     }
 }
 
-void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
-    const struct ggml_tensor * src0 = dst->src[0];  // conv_x
+void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst,
+                           ggml_tensor * concat_node, ggml_tensor * state_update_node) {
+    // meow: when concat_node is set, src0 is a CONCAT(state, x) that we read
+    // in-place instead of materializing; state_update_node (a CPY) is folded
+    // into the kernel epilogue.
+    const struct ggml_tensor * concat = concat_node;
+    const struct ggml_tensor * src0 = concat ? concat->src[1] : dst->src[0];  // conv_x (the x part)
+    const struct ggml_tensor * src0_state = concat ? concat->src[0] : nullptr; // conv_state part
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
     const bool fuse_bias = bias_add_node != nullptr;
     const bool fuse_silu = silu_dst != nullptr;
@@ -178,9 +234,12 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     const int64_t n_s = out->ne[2];                 // number of sequences in the batch
 
     GGML_ASSERT(out->ne[0] == nr);
-    GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(src1->nb[0] == sizeof(float));
-    GGML_ASSERT(src0->nb[1] == src0->ne[0] * sizeof(float));
+    if (concat == nullptr) {
+        // plain path expects the column-contiguous layout the kernels assumed
+        GGML_ASSERT(src0->nb[0] == sizeof(float));
+        GGML_ASSERT(src0->nb[1] == src0->ne[0] * sizeof(float));
+    }
 
     const float * src0_d = (const float *) src0->data;
     const float * src1_d = (const float *) src1->data;
@@ -196,11 +255,35 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         GGML_ASSERT(ggml_nelements(bias) == nr);
     }
 
+    const float * st_d   = src0_state ? (const float *) src0_state->data : nullptr;
+    const int     st_nb1 = src0_state ? (int) src0_state->nb[1] : 0;
+    const int     st_nb2 = src0_state ? (int) src0_state->nb[2] : 0;
+    const int64_t st_cols = src0_state ? src0_state->ne[0] : 0;
+    // per-part strides in floats: state (ch, col), x (ch, col)
+    const int st_cs = src0_state ? (int) (src0_state->nb[1] / sizeof(float)) : 0;
+    const int st_ls = src0_state ? (int) (src0_state->nb[0] / sizeof(float)) : 1;
+    const int x_cs  = (int) (src0->nb[1] / sizeof(float));
+    const int x_ls  = (int) (src0->nb[0] / sizeof(float));
+
+    float *     upd_d   = nullptr;
+    int         upd_nb2 = 0;
+    if (state_update_node != nullptr) {
+        // ggml cpy: src[0] = source, src[1] = destination; write straight into the cache view
+        const ggml_tensor * upd_view = state_update_node->src[1];
+        if (upd_view != nullptr) {
+            upd_d   = (float *) upd_view->data;
+            upd_nb2 = upd_view->nb[1] >= (int64_t) sizeof(float) ? (int) upd_view->nb[1] : 0;
+            if (upd_view->nb[1] == 0) {
+                upd_d = nullptr; // not a per-seq strided view; bail on the epilogue
+            }
+        }
+    }
+
     if (fuse_silu) {
         ssm_conv_f32_cuda<true>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
-                          out->nb[2], nc, nr, n_t, n_s, stream);
+                          out->nb[2], nc, nr, n_t, n_s, stream, st_d, st_nb1, st_nb2, st_cols, st_cs, st_ls, x_cs, x_ls, upd_d, upd_nb2);
     } else {
         ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
-                          out->nb[2], nc, nr, n_t, n_s, stream);
+                          out->nb[2], nc, nr, n_t, n_s, stream, st_d, st_nb1, st_nb2, st_cols, st_cs, st_ls, x_cs, x_ls, upd_d, upd_nb2);
     }
 }

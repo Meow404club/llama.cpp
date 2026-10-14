@@ -3759,6 +3759,118 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // meow: CONCAT(conv_state, x) -> [VIEW VIEW CPY state-update] ... SSM_CONV [-> UNARY silu].
+    // Executes the conv reading (state, x) in place (both layouts supported),
+    // folds the rolled state-update copy into the kernel epilogue, and clears
+    // the COMPUTE flag of the downstream nodes whose work is now done, so the
+    // executor skips them even though they are not adjacent in node order.
+    if (node->op == GGML_OP_CONCAT) {
+        // meow: GGML_CONV_FUSE_MODE: 0=off, 1=conv only (bitwise-comparable),
+        // 2=conv+silu (default)
+        static const int conv_fuse_mode = []() {
+            const char * e = getenv("GGML_CONV_FUSE_MODE");
+            return e ? atoi(e) : 2;
+        }();
+        if (conv_fuse_mode == 0) {
+            return 0;
+        }
+        const int n_nodes = cgraph->n_nodes;
+        int conv_idx = -1;
+        for (int j = i + 1; j < n_nodes && j <= i + 20; ++j) {
+            if (cgraph->nodes[j]->op == GGML_OP_SSM_CONV) {
+                if (cgraph->nodes[j]->src[0] == node) {
+                    conv_idx = j;
+                }
+                break;
+            }
+        }
+        if (conv_idx > 0) {
+            ggml_tensor * conv = cgraph->nodes[conv_idx];
+
+            // the only allowed extra consumers of the concat are the state-update
+            // chain (VIEW, VIEW, CPY) immediately after it
+            ggml_tensor * upd_cpy = nullptr;
+            bool ok_fuse = true;
+            if (i + 3 < n_nodes &&
+                    cgraph->nodes[i + 1]->op == GGML_OP_VIEW &&
+                    cgraph->nodes[i + 2]->op == GGML_OP_VIEW &&
+                    cgraph->nodes[i + 3]->op == GGML_OP_CPY) {
+                ggml_tensor * v1  = cgraph->nodes[i + 1];
+                ggml_tensor * cpy = cgraph->nodes[i + 3];
+                const ggml_tensor * st_part = node->src[0];
+                const int64_t nc1   = st_part->ne[0];
+                const int64_t tail_off = (node->ne[0] - nc1) * node->nb[0];
+                const int64_t view_off = ((int64_t *) v1->op_params)[0];
+                const bool views_node = (v1->src[0] == node) || (v1->src[0] == cgraph->nodes[i + 2] && cgraph->nodes[i + 2]->src[0] == node);
+                if (cpy->src[0] == v1 && views_node && view_off == tail_off) {
+                    upd_cpy = cpy;
+                }
+            }
+
+            // any other consumer of the concat anywhere in the layer window -> bail
+            for (int j = i + 1; j < n_nodes && j <= i + 40 && ok_fuse; ++j) {
+                if (upd_cpy != nullptr && j >= i + 1 && j <= i + 3) {
+                    continue;
+                }
+                if (j == conv_idx) {
+                    continue;
+                }
+                for (int s2 = 0; s2 < GGML_MAX_SRC; ++s2) {
+                    if (cgraph->nodes[j]->src[s2] == node) {
+                        ok_fuse = false;
+                        break;
+                    }
+                }
+            }
+            // nodes between the update chain and the conv must not read the concat
+            for (int j = i + 4; j < conv_idx && ok_fuse; ++j) {
+                for (int s2 = 0; s2 < GGML_MAX_SRC; ++s2) {
+                    if (cgraph->nodes[j]->src[s2] == node) {
+                        ok_fuse = false;
+                        break;
+                    }
+                }
+            }
+
+            if (ok_fuse && node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
+                    node->src[0]->nb[0] == sizeof(float)) {
+                ggml_tensor * silu = nullptr;
+                if (conv_idx + 1 < n_nodes && cgraph->nodes[conv_idx + 1]->op == GGML_OP_UNARY &&
+                        ggml_get_unary_op(cgraph->nodes[conv_idx + 1]) == GGML_UNARY_OP_SILU &&
+                        cgraph->nodes[conv_idx + 1]->src[0] == conv) {
+                    silu = cgraph->nodes[conv_idx + 1];
+                }
+                // conv raw output must not have consumers besides the (optional) silu
+                if (silu != nullptr) {
+                    for (int j = 0; j < n_nodes; ++j) {
+                        if (j == conv_idx + 1) {
+                            continue;
+                        }
+                        for (int s2 = 0; s2 < GGML_MAX_SRC; ++s2) {
+                            if (cgraph->nodes[j]->src[s2] == conv) {
+                                ok_fuse = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (ok_fuse) {
+                    ggml_tensor * silu_arg = (conv_fuse_mode >= 2) ? silu : nullptr;
+                    ggml_cuda_op_ssm_conv(*cuda_ctx, conv, nullptr, silu_arg, node, upd_cpy);
+                    for (int j = i + 1; j <= i + 3; ++j) {
+                        cgraph->nodes[j]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+                    }
+                    conv->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+                    if (silu_arg != nullptr) {
+                        silu->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+                    }
+                    return 3;
+                }
+            }
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
@@ -4697,6 +4809,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 bool ok;
 
+                // meow: WDDM batches kernel submissions; periodic event records act as
+                // flush points that keep the GPU fed. Costs ~12us CPU per flush.
+                static const int flush_every = []() {
+                    const char * e = getenv("GGML_FLUSH_EVERY");
+                    return e ? atoi(e) : 0;
+                }();
+                if (flush_every > 0 && !use_cuda_graph && (i % flush_every) == 0) {
+                    static cudaEvent_t flush_ev = nullptr;
+                    if (!flush_ev) {
+                        cudaEventCreateWithFlags(&flush_ev, cudaEventDisableTiming);
+                    }
+                    CUDA_CHECK(cudaEventRecord(flush_ev, cuda_ctx->stream()));
+                }
+
                 // meow: distortion-free op profiler. Instruments 1 eval per
                 // GGML_CUDA_PROFILE_EVERY (default 48) and drains the previous
                 // instrumented eval's events at the next one - by then the GPU has
@@ -4796,6 +4922,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            { // meow: one-shot ordered node dump
+                static const bool dump_names = (getenv("GGML_CUDA_GRAPH_NAMES") != nullptr);
+                static bool dumped = false;
+                if (dump_names && !dumped) {
+                    dumped = true;
+                    for (int di = 0; di < cgraph->n_nodes; di++) {
+                        fprintf(stderr, "[nodes] %4d %-30s %s\n", di, ggml_op_name(cgraph->nodes[di]->op),
+                                cgraph->nodes[di]->name ? cgraph->nodes[di]->name : "?");
+                    }
+                }
+            }
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             if (ggml_cuda_graph_debug_enabled()) {
@@ -4810,6 +4947,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                     fprintf(stderr, "[cg-dbg] captured graph for key %p: ggml nodes %d, device graph nodes %zu\n",
                             graph_key, cgraph->n_nodes, graph_nodes);
+                    std::map<ggml_op, std::map<std::string, int>> name_count; // meow-debug: per-op node names
+                    for (int i2 = 0; i2 < cgraph->n_nodes; i2++) {
+                        ggml_tensor * n2 = cgraph->nodes[i2];
+                        if (!ggml_cuda_is_view_or_noop(n2) && (n2->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                            name_count[n2->op][n2->name ? n2->name : "?"]++;
+                        }
+                    }
                     std::vector<std::pair<int, ggml_op>> sorted;
                     for (auto & kv : op_count) {
                         sorted.push_back({kv.second, kv.first});
@@ -4818,6 +4962,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                               [](const auto & a, const auto & b) { return a.first > b.first; });
                     for (size_t i = 0; i < sorted.size() && i < 18; i++) {
                         fprintf(stderr, "[cg-dbg]   op %-24s x %d\n", ggml_op_name(sorted[i].second), sorted[i].first);
+                        int shown = 0;
+                        for (auto & nc : name_count[sorted[i].second]) {
+                            if (shown++ >= 2) { break; }
+                            fprintf(stderr, "[cg-dbg]      e.g. %-44s x %d' + NL + '", nc.first.c_str(), nc.second);
+                        }
                     }
                 }
             }
