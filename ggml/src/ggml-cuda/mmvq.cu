@@ -424,6 +424,44 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }
+    // meow: on RDNA3 the WMMA MMQ kernels (#17576) beat MMVQ once the batch
+    // redoes enough per-column dequant work. Seeded A/B on gfx1100 (RX 7900 XT,
+    // IQ3_S 27B + Q4_K_M dflash2 draft): routing batch >= 4 to MMQ cuts the
+    // spec-decode step 77.0 -> 66.7 ms (+13%); the draft-side Q4_K switch alone
+    // is worth ~9 t/s; batch 1-2 stays MMVQ (tied with MMQ there).
+    // Restricted to quants MMQ supports - anything else must fall through to
+    // the stock path so it still reaches cuBLAS instead of an unsupported kernel.
+    if (GGML_CUDA_CC_IS_RDNA3(cc)) {
+        switch (type) {
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q3_K:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_IQ2_XXS:
+            case GGML_TYPE_IQ2_XS:
+            case GGML_TYPE_IQ2_S:
+            case GGML_TYPE_IQ3_XXS:
+            case GGML_TYPE_IQ3_S:
+            case GGML_TYPE_IQ4_XS:
+            case GGML_TYPE_IQ4_NL:
+                return ne11 <= 3;
+            default:
+                break;
+        }
+    }
+    // meow: env override for tuning the mmvq->mmq crossover (AMD RDNA3, see #29820).
+    // GGML_CUDA_MMVQ_MAX=N allows MMVQ only for ne11 <= N; negative/absent = stock behavior.
+    {
+        static const int env_max = []() {
+            const char * e = getenv("GGML_CUDA_MMVQ_MAX");
+            return e ? atoi(e) : -1;
+        }();
+        if (env_max >= 0) {
+            return ne11 <= env_max;
+        }
+    }
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
 }
 
