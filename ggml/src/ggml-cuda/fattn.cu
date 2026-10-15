@@ -151,6 +151,12 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+#define FATTN_DBG_PRINT(nc1) do { \
+    static const bool dbg = getenv("GGML_FATTN_DBG") != nullptr; \
+    if (dbg) fprintf(stderr, "[fattn-dbg] DKQ=%d DV=%d ncols1=%d ncols2=%d Qne1=%lld\n", \
+        DKQ, DV, (int)(nc1), ncols2, (long long) Q->ne[1]); \
+} while (0)
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -183,10 +189,12 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
 
     if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
             (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
+        FATTN_DBG_PRINT(32/ncols2);
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
 
+    FATTN_DBG_PRINT(64/ncols2);
     ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
 }
 
@@ -219,6 +227,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
+    {
+        static const bool dbg2 = getenv("GGML_FATTN_DBG") != nullptr;
+        if (dbg2) fprintf(stderr, "[fattn-dbg2] DKQ=%d DV=%d ratio=%d gqa_opt=%d Qne=[%lld,%lld,%lld,%lld] Kne=[%lld,%lld,%lld,%lld] Ktype=%d Vtype=%d mask=%p\n",
+            DKQ, DV, gqa_ratio, (int) use_gqa_opt,
+            (long long)Q->ne[0], (long long)Q->ne[1], (long long)Q->ne[2], (long long)Q->ne[3],
+            (long long)K->ne[0], (long long)K->ne[1], (long long)K->ne[2], (long long)K->ne[3],
+            (int)K->type, (int)V->type, (void*)mask);
+    }
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
@@ -247,17 +263,22 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // On RDNA it is preferable to minimize wasted compute vs. duplicate I/O for the mask.
     if (amd_wmma_available(cc)) {
-        if (use_gqa_opt && gqa_ratio % 8 == 0) {
+        // meow: tuning override for the KV-head reuse width (GQA tile)
+        static const int force_ncols2 = []() {
+            const char * e = getenv("GGML_FATTN_FORCE_NCOLS2");
+            return e ? atoi(e) : 0;
+        }();
+        if (force_ncols2 == 8 || (force_ncols2 == 0 && use_gqa_opt && gqa_ratio % 8 == 0)) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
             return;
         }
 
-        if (use_gqa_opt && gqa_ratio % 4 == 0) {
+        if (force_ncols2 == 4 || (force_ncols2 == 0 && use_gqa_opt && gqa_ratio % 4 == 0)) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
             return;
         }
 
-        if (use_gqa_opt && gqa_ratio % 2 == 0) {
+        if (force_ncols2 == 2 || (force_ncols2 == 0 && use_gqa_opt && gqa_ratio % 2 == 0)) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
             return;
         }
