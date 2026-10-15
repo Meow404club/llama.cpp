@@ -2814,11 +2814,6 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return cgraph->nodes[0];
 }
 
-static bool ggml_cuda_graph_debug_enabled() {
-    static const bool enabled = (getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr);
-    return enabled;
-}
-
 static void ggml_cuda_graph_debug_print_diff(const ggml_cuda_graph::node_properties & old_prop, const ggml_tensor * node, int i) {
     fprintf(stderr, "[cg-dbg] node %d changed: %-28s op=%s\n", i, node->name, ggml_op_name(node->op));
     if (old_prop.node.data != node->data) {
