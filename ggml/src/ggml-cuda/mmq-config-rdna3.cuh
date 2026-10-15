@@ -115,6 +115,9 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_Q4_K, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, true);
     CASE(GGML_TYPE_Q4_K, 256, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, true);
     CASE(GGML_TYPE_Q4_K, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, true);
+    // meow: small-batch experiment - J=8 covers verify batches exactly (no padded j slots),
+    // I=32 doubles CTA count (N=5120 -> 160 CTAs on 84 CUs) to hide the per-k-step global load latency.
+    CASE(GGML_TYPE_Q4_K, 128, 1,  32,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_Q4_K, 128, 1,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_Q4_K, 128, 1,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_Q4_K, 128, 1,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);

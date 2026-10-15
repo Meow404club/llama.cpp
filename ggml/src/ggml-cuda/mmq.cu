@@ -4,8 +4,51 @@
 #include "mmid.cuh"
 
 #include <cstdint>
+#include <mutex>
+#include <unordered_map>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
+    // meow: pure-kernel self-time. Repeats only the GEMM kernel launch (src1 quantization
+    // already happened upstream), so the event window has zero inter-node submission gaps in it.
+    static const int self_n = []() {
+        const char * e = getenv("GGML_MMQ_SELFTIME");
+        return e ? std::max(1, atoi(e)) : 0;
+    }();
+    if (self_n > 0 && !args.fusion.gate && args.type_x == GGML_TYPE_Q4_K) {
+        mul_mat_q_case<GGML_TYPE_Q4_K, GGML_PREC_Q8>(ctx, args, stream); // warm clocks/caches once
+        cudaEvent_t ev0, ev1;
+        hipEventCreateWithFlags(&ev0, 0);
+        hipEventCreateWithFlags(&ev1, 0);
+        hipEventRecord(ev0, stream);
+        for (int r = 0; r < self_n; ++r) {
+            mul_mat_q_case<GGML_TYPE_Q4_K, GGML_PREC_Q8>(ctx, args, stream);
+        }
+        hipEventRecord(ev1, stream);
+        hipEventSynchronize(ev1);
+        float ms = 0.0f;
+        hipEventElapsedTime(&ms, ev0, ev1);
+        hipEventDestroy(ev0);
+        hipEventDestroy(ev1);
+        static std::mutex mu;
+        std::lock_guard<std::mutex> lk(mu);
+        static std::unordered_map<uint64_t, std::pair<double,int>> agg; // key -> (sum us, count)
+        static long long calls = 0;
+        const uint64_t key = (uint64_t) args.nrows_x << 28 | (uint64_t) args.ncols_x << 12 | (uint64_t) args.ncols_y;
+        auto & a = agg[key];
+        a.first  += 1000.0 * ms / self_n;
+        a.second += 1;
+        if (++calls % (61*8) == 0) {
+            fprintf(stderr, "[mmq-selftime] N x K, batch, J -> us/kernel, eff GB/s (Q4_K bytes):\n");
+            for (auto & kv : agg) {
+                const int64_t nr = kv.first >> 28, nc = (kv.first >> 12) & 0xFFFF, ny = kv.first & 0xFFF;
+                const double us = kv.second.first / kv.second.second;
+                fprintf(stderr, "[mmq-selftime] %6lld x %6lld, b%3lld, J%3d -> %7.1f us, %6.1f GB/s (n=%d)\n",
+                        (long long) nr, (long long) nc, (long long) ny, args.J_best, us,
+                        nr * (double) nc * 0.5625 / us / 1000.0, kv.second.second);
+            }
+        }
+        return;
+    }
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_q_case<GGML_TYPE_Q1_0, GGML_PREC_Q8>(ctx, args, stream);
