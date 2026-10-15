@@ -2018,7 +2018,19 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+    bool use_mmvq_here = ggml_cuda_should_use_mmvq(src0->type, cc, ne11);
+    if (!use_mmvq_here) {
+        // meow: dp4a MMQ tiles (J=128) starve the GPU on narrow outputs at mid batch:
+        // N=5120 -> only 40 CTAs on 84 CUs while MMVQ's fine grid fills the device.
+        // Measured on gfx1100: forward(3)=32ms -> forward(4)=48ms (+16ms) for ALL of
+        // MMQ/MMVQ-table/hipblas, because MMVQ was table-blocked at ne11>3. Route
+        // ne11 in [4,8] with modest ne01 back to MMVQ. Env-off switch for A/B.
+        static const bool midbatch_mmvq = getenv("GGML_MMVQ_MIDBATCH_OFF") == nullptr;
+        if (midbatch_mmvq && ne11 >= 4 && ne11 <= 7 && ne01 <= 12288) {
+            use_mmvq_here = true;
+        }
+    }
+    if (use_mmvq_here) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -4843,9 +4855,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 struct prof_state_t {
                     std::vector<cudaEvent_t> ev_start, ev_stop;
                     std::vector<std::pair<int, ggml_op>> pending; // node idx + op recorded last time
-                    std::unordered_map<ggml_op, double> ms;
+                    std::vector<std::string> names;                    std::unordered_map<ggml_op, double> ms;
                     std::unordered_map<ggml_op, int>    cnt;
-                    long long evals = 0;       // all graph computes
+                    std::unordered_map<std::string, std::pair<double,int>> ms_name;                    long long evals = 0;       // all graph computes
                     long long instr = 0;       // instrumented evals
                     long long drained = 0;     // drained instrumented evals
                 };
@@ -4868,6 +4880,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             if (ms >= 0.0f) {
                                 st.ms[pr.second] += ms;
                                 st.cnt[pr.second] += 1;
+                                if (pr.second == GGML_OP_MUL_MAT) {
+                                    st.ms_name[st.names[pr.first]].first += ms;
+                                    st.ms_name[st.names[pr.first]].second += 1;
+                                }
                             }
                         }
                         st.drained++;
@@ -4889,6 +4905,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                         100.0 * sorted[k].first / (total > 0 ? total : 1));
                             }
                             fprintf(stderr, "[prof]   %-24s %8.4f ms/eval\n", "TOTAL(sum)", total);
+                            {
+                                std::vector<std::pair<double, std::string>> sn;
+                                for (auto & kv : st.ms_name) sn.push_back({kv.second.first / st.drained, kv.first});
+                                std::sort(sn.begin(), sn.end(), [](const auto & a, const auto & b){ return a.first > b.first; });
+                                for (size_t k = 0; k < sn.size() && k < 10; ++k) {
+                                    fprintf(stderr, "[prof]   %-40s %8.4f ms/eval x %d\n", sn[k].second.c_str(), sn[k].first,
+                                            (int)(st.ms_name[sn[k].second].second / st.drained));
+                                }
+                            }
                         }
                     }
                     }
@@ -4900,6 +4925,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         cudaEventCreateWithFlags(&st.ev_start[i], 0);
                         cudaEventCreateWithFlags(&st.ev_stop[i], 0);
                     }
+                    if ((int) st.names.size() <= i) st.names.resize(i + 1);
+                    st.names[i] = node->name ? node->name : "?";
                     CUDA_CHECK(cudaEventRecord(st.ev_start[i], cuda_ctx->stream()));
                     ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                     CUDA_CHECK(cudaEventRecord(st.ev_stop[i], cuda_ctx->stream()));
