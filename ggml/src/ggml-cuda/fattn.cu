@@ -269,6 +269,17 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
             const char * e = getenv("GGML_FATTN_FORCE_NCOLS2");
             return e ? atoi(e) : 0;
         }();
+        // meow: GQA6 single-pass packing - ratio exactly 6 packs all query heads of a KV group
+        // into one pass (ncols1=16 x ncols2=6), tripling arithmetic intensity per KV byte.
+        // The kernel is KV-bandwidth bound at long context otherwise (~26 TF ceiling at ncols2=2).
+        static const bool gqa6_on = []() {
+            const char * e = getenv("GGML_FATTN_GQA6");
+            return e ? atoi(e) != 0 : false;
+        }();
+        if (gqa6_on && Q->ne[0] == 256 && K->ne[0] == 256 && Q->ne[2] / K->ne[2] == 6 && Q->ne[1] >= 48) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 16, 6>(ctx, dst);
+            return;
+        }
         if (force_ncols2 == 8 || (force_ncols2 == 0 && use_gqa_opt && gqa_ratio % 8 == 0)) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
             return;
