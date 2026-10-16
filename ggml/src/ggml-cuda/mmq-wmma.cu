@@ -178,6 +178,7 @@ mul_mat_wmma_kernel(const char * __restrict__ wq,  const size_t w_stride,
             wstep[rep] = task & 3;
         }
     }
+    load_regs_ptr(); // chunk 0 - without this the first store_regs() writes uninit registers
     for (int k0 = 0; k0 < K; k0 += WMMMA_KC) {
         __syncthreads();
         store_regs();
@@ -230,6 +231,141 @@ static void launch_wmma(cudaStream_t stream, const char * wq, size_t w_stride, c
     mul_mat_wmma_kernel<mg, ng, DQ><<<grid, block, 0, stream>>>(wq, w_stride, xf, x_stride, dst, dsm, dsn, M, N, K);
 }
 
+// ---- small-batch variant (M <= 16, decode / speculative verify batches) ----
+// 128 threads = 4 wave32; n tile 64 (one 16-wide wmma n-segment per warp); m is a single
+// 16-wide wmma segment with batch rows zero-padded in xs. Each CTA streams 64 contiguous
+// weight rows (like MMVQ's row-major streaming) while dequantizing every weight exactly
+// once (like MMQ), so neither the ALU-per-batch-row nor the strided-tile DRAM pattern of
+// the two stock kernels applies.
+#define WMMAS_TN 64
+
+template<bool need_n_guard, typename DQ>
+static __global__ void __launch_bounds__(128)
+mul_mat_wmma_small_kernel(const char * __restrict__ wq,  const size_t w_stride,
+                          const char * __restrict__ xf,  const size_t x_stride,
+                          char * __restrict__ dst,       const size_t dst_stride_m, const size_t dst_stride_n,
+                          const int M, const int N, const int K) {
+    __shared__ wmma_half xs[16][WMMMA_LDSTRIDE];
+    __shared__ wmma_half ws[WMMAS_TN][WMMMA_LDSTRIDE];
+
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    const int nw = blockIdx.x * WMMAS_TN;
+    const int n0 = nw + warp*16;
+
+    wmma_acc8 acc;
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) acc[r] = 0.f;
+
+    const size_t x_stride4 = x_stride / sizeof(float4);
+    const float4 * xk = nullptr;                 // start of the current 64-wide k chunk
+    float4   pre_x[2];                           // one x task per thread: 8 f32 (2 float4)
+    wmma_half16 pre_w[2];
+    const char * wp[2] = {nullptr, nullptr};
+    int wstep[2] = {0, 0};                       // j0 = (wstep & 15)*16, block = wstep >> 4
+
+    auto load_regs_ptr = [&]() {
+        {
+            const int r  = tid >> 3;             // x row (0..15)
+            const int co = (tid & 7) * 2;        // 8-f32 slot within the chunk, float4 units
+            if (r < M) {
+                const float4 * src = xk + (size_t)r * x_stride4 + co;
+                pre_x[0] = src[0];
+                pre_x[1] = src[1];
+            } else {
+                const float4 z = {0.f, 0.f, 0.f, 0.f};
+                pre_x[0] = pre_x[1] = z;
+            }
+        }
+        #pragma unroll
+        for (int rep = 0; rep < 2; ++rep) {
+            const int task = tid + rep*128;
+            const int r = task >> 2;             // weight row (0..63)
+            if (need_n_guard ? (nw + r < N) : true) {
+                DQ::frag16((const typename DQ::block_t *)(wp[rep]) + (wstep[rep] >> 4), (wstep[rep] & 15)*16, (wmma_half *)&pre_w[rep]);
+            } else {
+                pre_w[rep] = (wmma_half16)0.f;
+            }
+        }
+        xk += WMMMA_KC / 4;
+        wstep[0] += WMMMA_KC / 16;
+        wstep[1] += WMMMA_KC / 16;
+    };
+
+    auto store_regs = [&]() {
+        {
+            const int r  = tid >> 3;
+            const int cb = (tid & 7) << 3;
+            wmma_half * d = &xs[r][cb];
+            d[0] = (wmma_half)pre_x[0].x; d[1] = (wmma_half)pre_x[0].y;
+            d[2] = (wmma_half)pre_x[0].z; d[3] = (wmma_half)pre_x[0].w;
+            d[4] = (wmma_half)pre_x[1].x; d[5] = (wmma_half)pre_x[1].y;
+            d[6] = (wmma_half)pre_x[1].z; d[7] = (wmma_half)pre_x[1].w;
+        }
+        #pragma unroll
+        for (int rep = 0; rep < 2; ++rep) {
+            const int task = tid + rep*128;
+            const int r  = task >> 2;
+            const int ks = task & 3;
+            *(wmma_half16 *)&ws[r][ks*16] = pre_w[rep];
+        }
+    };
+
+    {
+        xk = (const float4 *)xf;
+        #pragma unroll
+        for (int rep = 0; rep < 2; ++rep) {
+            const int task = tid + rep*128;
+            const int r = task >> 2;
+            wp[rep] = (const char *)(wq + (size_t)(nw + r) * w_stride);
+            wstep[rep] = task & 3;
+        }
+    }
+    load_regs_ptr(); // chunk 0 - without this the first store_regs() writes uninit registers
+    for (int k0 = 0; k0 < K; k0 += WMMMA_KC) {
+        __syncthreads();
+        store_regs();
+        if (k0 + WMMMA_KC < K) load_regs_ptr();
+        __syncthreads();
+
+        const wmma_half16 * arow_p = (const wmma_half16 *)&xs[lane & 15][0];
+        const wmma_half16 * brow_p = (const wmma_half16 *)&ws[warp*16 + (lane & 15)][0];
+        #pragma unroll
+        for (int ks = 0; ks < WMMMA_KC / 16; ++ks) {
+            const wmma_half16 a = arow_p[ks];
+            const wmma_half16 b = brow_p[ks];
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc);
+        }
+    }
+
+    // lane holds D[m = 2r + (lane>=16)][n = n0 + lane&15]
+    const int n = n0 + (lane & 15);
+    if (need_n_guard ? (n < N) : true) {
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int m = 2*r + (lane >= 16);
+            if (m < M) {
+                *(float *)(dst + (size_t)n * dst_stride_m + (size_t)m * dst_stride_n) = acc[r];
+            }
+        }
+    }
+}
+
+template<typename DQ>
+static void mul_mat_wmma_small_dispatch(cudaStream_t stream, const char * wq, size_t w_stride, const char * xf, size_t x_stride,
+                                        char * dst, size_t dsm, size_t dsn, int M, int N, int K) {
+    const dim3 block(128);
+    const dim3 grid((N + WMMAS_TN - 1) / WMMAS_TN);
+    if ((N % WMMAS_TN) != 0) {
+        mul_mat_wmma_small_kernel<true, DQ><<<grid, block, 0, stream>>>(wq, w_stride, xf, x_stride, dst, dsm, dsn, M, N, K);
+    } else {
+        mul_mat_wmma_small_kernel<false, DQ><<<grid, block, 0, stream>>>(wq, w_stride, xf, x_stride, dst, dsm, dsn, M, N, K);
+    }
+}
+
+
 template<typename DQ>
 static void mul_mat_wmma_dispatch(cudaStream_t stream, const char * wq, size_t w_stride, const char * xf, size_t x_stride,
                                   char * dst, size_t dsm, size_t dsn, int M, int N, int K) {
@@ -250,26 +386,51 @@ void ggml_cuda_mul_mat_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor *
 
 
     if (src0->type == GGML_TYPE_Q4_K) {
-        mul_mat_wmma_dispatch<WQ4K>(stream, (const char *)src0->data, src0->nb[1], (const char *)src1->data, src1->nb[1],
-                                    (char *)dst->data, dst->nb[0], dst->nb[1], M, N, K);
+        if (M <= 16) {
+            mul_mat_wmma_small_dispatch<WQ4K>(stream, (const char *)src0->data, src0->nb[1], (const char *)src1->data, src1->nb[1],
+                                              (char *)dst->data, dst->nb[0], dst->nb[1], M, N, K);
+        } else {
+            mul_mat_wmma_dispatch<WQ4K>(stream, (const char *)src0->data, src0->nb[1], (const char *)src1->data, src1->nb[1],
+                                        (char *)dst->data, dst->nb[0], dst->nb[1], M, N, K);
+        }
     } else {
-        mul_mat_wmma_dispatch<WIQ3S>(stream, (const char *)src0->data, src0->nb[1], (const char *)src1->data, src1->nb[1],
-                                     (char *)dst->data, dst->nb[0], dst->nb[1], M, N, K);
+        if (M <= 16) {
+            mul_mat_wmma_small_dispatch<WIQ3S>(stream, (const char *)src0->data, src0->nb[1], (const char *)src1->data, src1->nb[1],
+                                               (char *)dst->data, dst->nb[0], dst->nb[1], M, N, K);
+        } else {
+            mul_mat_wmma_dispatch<WIQ3S>(stream, (const char *)src0->data, src0->nb[1], (const char *)src1->data, src1->nb[1],
+                                         (char *)dst->data, dst->nb[0], dst->nb[1], M, N, K);
+        }
     }
 }
 
 bool ggml_cuda_should_use_wmma(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int cc, const int64_t ne11) {
-    static const bool enabled = getenv("GGML_MMQ_WMMA") != nullptr;
-    if (!enabled) return false;
     if (!GGML_CUDA_CC_IS_RDNA3(cc)) return false;
     if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_IQ3_S) return false;
     if (src1->type != GGML_TYPE_F32 || src1->nb[0] != sizeof(float)) return false;
     if (!ggml_is_contiguous(src0)) return false;
     if (src0->ne[0] % 256 != 0) return false;
-    if (ne11 < 64) return false; // small batches: dp4a MMVQ/MMQ path wins
     // ggml dst layout [N, M]: feature stride nb[0], token stride nb[1] == N*4 for plain outputs.
     if (dst->nb[0] != sizeof(float) || dst->nb[1] != sizeof(float)*src0->ne[1]) return false;
-    return true;
+    if (ne11 < 64) {
+        // small-batch variant: decode / speculative verify batches. The env value is the
+        // batch floor (GGML_WMMA_SMALL=1 also covers greedy single-row decode for testing).
+        static const int small_min = []() {
+            const char * e = getenv("GGML_WMMA_SMALL");
+            return e ? atoi(e) : 0;
+        }();
+        if (small_min < 1 || ne11 < small_min || ne11 > 16) return false;
+        // bisect switch: 1 = both types, 4 = Q4_K only, 3 = IQ3_S only
+        static const int small_types = []() {
+            const char * e = getenv("GGML_WMMA_SMALL_TYPES");
+            return e ? atoi(e) : 1;
+        }();
+        if (small_types == 4 && src0->type != GGML_TYPE_Q4_K) return false;
+        if (small_types == 3 && src0->type != GGML_TYPE_IQ3_S) return false;
+        return true;
+    }
+    static const bool enabled = getenv("GGML_MMQ_WMMA") != nullptr;
+    return enabled;
 }
 
 #else // non-HIP fallback stubs

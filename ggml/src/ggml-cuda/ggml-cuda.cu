@@ -2062,6 +2062,63 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
+    if (ne2 == 1 && ne3 == 1 && ggml_cuda_should_use_wmma(src0, src1, dst, cc, ne11)) {
+        ggml_cuda_mul_mat_wmma(ctx, src0, src1, dst);
+        // meow: A/B verify - rerun the stock path into dst and diff against the wmma result
+        static const int verify = []() {
+            const char * e = getenv("GGML_WMMA_SMALL_VERIFY");
+            return e ? std::max(1, atoi(e)) : 0;
+        }();
+        if (verify > 0 && ne11 <= 16) {
+            static int checks = 0;
+            if (checks < 40*verify) {
+                cudaStream_t stream = ctx.stream();
+                const size_t nn = ggml_nelements(dst);
+                { // meow: dump the first few real tensors for offline replay
+                    static const int dump_n = []() { const char * e = getenv("GGML_WMMA_DUMP"); return e ? atoi(e) : 0; }();
+                    if (checks < dump_n) {
+                        char fn[128];
+                        snprintf(fn, sizeof(fn), "D:/Tool/rocm-ref/probe/dump_%d.bin", checks);
+                        FILE * f = fopen(fn, "wb");
+                        if (f) {
+                            int hdr[6] = {(int)ne11, (int)src0->ne[1], (int)src0->ne[0], (int)src0->type, (int)src1->ne[0], (int)src1->nb[1]};
+                            fwrite(hdr, sizeof(int), 6, f);
+                            std::vector<char> buf;
+                            const size_t wbytes = (size_t)src0->ne[1] * src0->nb[1];
+                            buf.resize(wbytes);
+                            CUDA_CHECK(cudaMemcpyAsync(buf.data(), src0->data, wbytes, cudaMemcpyDeviceToHost, stream));
+                            CUDA_CHECK(cudaStreamSynchronize(stream));
+                            fwrite(buf.data(), 1, wbytes, f);
+                            const size_t xbytes = (size_t)ne11 * src1->nb[1];
+                            buf.resize(xbytes);
+                            CUDA_CHECK(cudaMemcpyAsync(buf.data(), src1->data, xbytes, cudaMemcpyDeviceToHost, stream));
+                            CUDA_CHECK(cudaStreamSynchronize(stream));
+                            fwrite(buf.data(), 1, xbytes, f);
+                            fclose(f);
+                        }
+                    }
+                }
+                std::vector<float> got(nn);
+                CUDA_CHECK(cudaMemcpyAsync(got.data(), dst->data, nn*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst); // reference into dst
+                std::vector<float> ref(nn);
+                CUDA_CHECK(cudaMemcpyAsync(ref.data(), dst->data, nn*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                double maxe = 0.0; size_t bad = 0, argmax = 0;
+                for (size_t i = 0; i < nn; ++i) {
+                    const double e = std::fabs((double)ref[i] - (double)got[i]);
+                    if (e > maxe) { maxe = e; argmax = i; }
+                    bad += e > 1e-2f;
+                }
+                fprintf(stderr, "[wmma-verify %d] M=%lld N=%lld K=%lld nb1=%lld(4K=%lld) maxerr=%g bad=%llu/%llu (got=%g ref=%g at %llu)\n",
+                        checks, (long long)ne11, (long long)src0->ne[1], (long long)src0->ne[0], (long long)src1->nb[1], 4*(long long)src1->ne[0],
+                        maxe, (unsigned long long)bad, (unsigned long long)nn, got[argmax], ref[argmax], (unsigned long long)argmax);
+                checks++;
+            }
+        }
+        return;
+    }
     bool use_mmvq_here = ggml_cuda_should_use_mmvq(src0->type, cc, ne11);
     if (!use_mmvq_here) {
         // meow: dp4a MMQ tiles (J=128) starve the GPU on narrow outputs at mid batch:
@@ -2076,10 +2133,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (use_mmvq_here) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
-        return;
-    }
-    if (ne2 == 1 && ne3 == 1 && ggml_cuda_should_use_wmma(src0, src1, dst, cc, ne11)) {
-        ggml_cuda_mul_mat_wmma(ctx, src0, src1, dst);
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
