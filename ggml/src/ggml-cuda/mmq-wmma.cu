@@ -242,10 +242,10 @@ static void launch_wmma(cudaStream_t stream, const char * wq, size_t w_stride, c
 // weight rows (like MMVQ's row-major streaming) while dequantizing every weight exactly
 // once (like MMQ), so neither the ALU-per-batch-row nor the strided-tile DRAM pattern of
 // the two stock kernels applies.
-#define WMMAS_TN 64
+#define WMMAS_TN 32 // meow: 32 cols/CTA -> 160 CTAs at N=5120, fills 84 CUs x2 (64 threads each)
 
 template<bool need_n_guard, typename DQ>
-static __global__ void __launch_bounds__(128)
+static __global__ void __launch_bounds__(64)
 mul_mat_wmma_small_kernel(const char * __restrict__ wq,  const size_t w_stride,
                           const char * __restrict__ xf,  const size_t x_stride,
                           char * __restrict__ dst,       const size_t dst_stride_m, const size_t dst_stride_n,
@@ -266,28 +266,27 @@ mul_mat_wmma_small_kernel(const char * __restrict__ wq,  const size_t w_stride,
 
     const size_t x_stride4 = x_stride / sizeof(float4);
     const float4 * xk = nullptr;                 // start of the current 64-wide k chunk
-    float4   pre_x[2];                           // one x task per thread: 8 f32 (2 float4)
+    float4   pre_x[4];                           // one x task per thread: 16 f32 (4 float4)
     wmma_half16 pre_w[2];
     const char * wp[2] = {nullptr, nullptr};
     int wstep[2] = {0, 0};                       // j0 = (wstep & 15)*16, block = wstep >> 4
 
     auto load_regs_ptr = [&]() {
         {
-            const int r  = tid >> 3;             // x row (0..15)
-            const int co = (tid & 7) * 2;        // 8-f32 slot within the chunk, float4 units
+            const int r  = tid >> 2;             // x row (0..15)
+            const int co = (tid & 3) * 4;        // 16-f32 slot within the chunk, float4 units
             if (r < M) {
                 const float4 * src = xk + (size_t)r * x_stride4 + co;
-                pre_x[0] = src[0];
-                pre_x[1] = src[1];
+                pre_x[0] = src[0]; pre_x[1] = src[1]; pre_x[2] = src[2]; pre_x[3] = src[3];
             } else {
                 const float4 z = {0.f, 0.f, 0.f, 0.f};
-                pre_x[0] = pre_x[1] = z;
+                pre_x[0] = pre_x[1] = pre_x[2] = pre_x[3] = z;
             }
         }
         #pragma unroll
         for (int rep = 0; rep < 2; ++rep) {
-            const int task = tid + rep*128;
-            const int r = task >> 2;             // weight row (0..63)
+            const int task = tid + rep*64;
+            const int r = task >> 2;             // weight row (0..31)
             if (need_n_guard ? (nw + r < N) : true) {
                 DQ::frag16((const typename DQ::block_t *)(wp[rep]) + (wstep[rep] >> 4), (wstep[rep] & 15)*16, (wmma_half *)&pre_w[rep]);
             } else {
@@ -301,17 +300,21 @@ mul_mat_wmma_small_kernel(const char * __restrict__ wq,  const size_t w_stride,
 
     auto store_regs = [&]() {
         {
-            const int r  = tid >> 3;
-            const int cb = (tid & 7) << 3;
+            const int r  = tid >> 2;
+            const int cb = (tid & 3) << 4;
             wmma_half * d = &xs[r][cb];
-            d[0] = (wmma_half)pre_x[0].x; d[1] = (wmma_half)pre_x[0].y;
-            d[2] = (wmma_half)pre_x[0].z; d[3] = (wmma_half)pre_x[0].w;
-            d[4] = (wmma_half)pre_x[1].x; d[5] = (wmma_half)pre_x[1].y;
-            d[6] = (wmma_half)pre_x[1].z; d[7] = (wmma_half)pre_x[1].w;
+            d[0]  = (wmma_half)pre_x[0].x; d[1]  = (wmma_half)pre_x[0].y;
+            d[2]  = (wmma_half)pre_x[0].z; d[3]  = (wmma_half)pre_x[0].w;
+            d[4]  = (wmma_half)pre_x[1].x; d[5]  = (wmma_half)pre_x[1].y;
+            d[6]  = (wmma_half)pre_x[1].z; d[7]  = (wmma_half)pre_x[1].w;
+            d[8]  = (wmma_half)pre_x[2].x; d[9]  = (wmma_half)pre_x[2].y;
+            d[10] = (wmma_half)pre_x[2].z; d[11] = (wmma_half)pre_x[2].w;
+            d[12] = (wmma_half)pre_x[3].x; d[13] = (wmma_half)pre_x[3].y;
+            d[14] = (wmma_half)pre_x[3].z; d[15] = (wmma_half)pre_x[3].w;
         }
         #pragma unroll
         for (int rep = 0; rep < 2; ++rep) {
-            const int task = tid + rep*128;
+            const int task = tid + rep*64;
             const int r  = task >> 2;
             const int ks = task & 3;
             *(wmma_half16 *)&ws[r][ks*16] = pre_w[rep];
@@ -322,7 +325,7 @@ mul_mat_wmma_small_kernel(const char * __restrict__ wq,  const size_t w_stride,
         xk = (const float4 *)xf;
         #pragma unroll
         for (int rep = 0; rep < 2; ++rep) {
-            const int task = tid + rep*128;
+            const int task = tid + rep*64;
             const int r = task >> 2;
             wp[rep] = (const char *)(wq + (size_t)(nw + r) * w_stride);
             wstep[rep] = task & 3;
@@ -358,10 +361,74 @@ mul_mat_wmma_small_kernel(const char * __restrict__ wq,  const size_t w_stride,
     }
 }
 
+// ---- v3: direct-read small-batch variant - no smem, no __syncthreads ----
+// Each warp owns a 16-column output segment; lane (lane&15) feeds A row m (x row) and
+// B column n0+(lane%16) (weight row), both dequantized straight from global into
+// registers. The smem staging round trip of the v1/v2 kernels is pure overhead in the
+// bandwidth-bound small-batch regime (measured: MMVQ's direct-read structure wins).
+template<bool need_n_guard, typename DQ>
+static __global__ void __launch_bounds__(128)
+mul_mat_wmma_small_direct(const char * __restrict__ wq,  const size_t w_stride,
+                          const char * __restrict__ xf,  const size_t x_stride,
+                          char * __restrict__ dst,       const size_t dst_stride_m, const size_t dst_stride_n,
+                          const int M, const int N, const int K) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    const int nw = blockIdx.x * 64;
+    const int n0 = nw + warp*16;
+
+    wmma_acc8 acc;
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) acc[r] = 0.f;
+
+    const int mrow = lane & 15;                    // this lane's A row (0..15)
+    const int wrow = n0 + (lane & 15);             // this lane's B column = weight row
+    const float * xr = (const float *)(xf) + (size_t)mrow * (x_stride / sizeof(float));
+    const char * wr = (const char *)(wq + (size_t)wrow * w_stride);
+
+    wmma_half16 a_cur, b_cur, a_nxt, b_nxt;
+
+    auto load_k = [&](const int k0, wmma_half16 & a, wmma_half16 & b) {
+        if (mrow < M) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) ((wmma_half *)&a)[i] = (wmma_half)xr[k0 + i];
+        } else {
+            a = (wmma_half16)0.f;
+        }
+        if (need_n_guard ? (wrow < N) : true) {
+            DQ::frag16((const typename DQ::block_t *)wr + (k0 >> 8), k0 & 255, (wmma_half *)&b);
+        } else {
+            b = (wmma_half16)0.f;
+        }
+    };
+
+    load_k(0, a_cur, b_cur);
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        if (k0 + 16 < K) load_k(k0 + 16, a_nxt, b_nxt);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_cur, b_cur, acc);
+        a_cur = a_nxt;
+        b_cur = b_nxt;
+    }
+
+    const int n = n0 + (lane & 15);
+    if (need_n_guard ? (n < N) : true) {
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int m = 2*r + (lane >= 16);
+            if (m < M) {
+                *(float *)(dst + (size_t)n * dst_stride_m + (size_t)m * dst_stride_n) = acc[r];
+            }
+        }
+    }
+}
+
 template<typename DQ>
 static void mul_mat_wmma_small_dispatch(cudaStream_t stream, const char * wq, size_t w_stride, const char * xf, size_t x_stride,
                                         char * dst, size_t dsm, size_t dsn, int M, int N, int K) {
-    const dim3 block(128);
+    // meow: NT32 smem variant measured best of the small kernels (pp8 146 vs 143 NT64 / 100 direct);
+    // still 12% behind MMVQ (165), so GGML_WMMA_SMALL stays opt-in.
+    const dim3 block(64);
     const dim3 grid((N + WMMAS_TN - 1) / WMMAS_TN);
     if ((N % WMMAS_TN) != 0) {
         mul_mat_wmma_small_kernel<true, DQ><<<grid, block, 0, stream>>>(wq, w_stride, xf, x_stride, dst, dsm, dsn, M, N, K);
