@@ -1535,6 +1535,20 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// meow: decode-phase profiler (GGML_CTX_PHASE_PROF=1), ring-style: accumulate, print every 64 calls
+struct ctx_phase_prof_t {
+    double t_reuse = 0, t_setinp = 0, t_compute = 0; long long n = 0;
+    double v_reuse = 0, v_setinp = 0, v_compute = 0; long long vn = 0; // verify bucket (n_tokens > 2)
+};
+static ctx_phase_prof_t ctx_prof;
+static inline void ctx_phase_dump() {
+    if (ctx_prof.n > 0 && (ctx_prof.n % 64) == 0) {
+        fprintf(stderr, "[ctx-prof] draft-ubatch(ntok<=2): prep=%.3f compute=%.3f (n=%lld) | verify-ubatch(ntok>2): prep=%.3f compute=%.3f (n=%lld)\n",
+            ctx_prof.t_reuse/ctx_prof.n + ctx_prof.t_setinp/ctx_prof.n, ctx_prof.t_compute/ctx_prof.n, ctx_prof.n,
+            (ctx_prof.v_reuse + ctx_prof.v_setinp)/(ctx_prof.vn ? ctx_prof.vn : 1), ctx_prof.v_compute/(ctx_prof.vn ? ctx_prof.vn : 1), ctx_prof.vn);
+    }
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1547,6 +1561,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+    static const bool meow_ctx_prof = getenv("GGML_CTX_PHASE_PROF") != nullptr;
+    const int64_t tp0 = meow_ctx_prof ? ggml_time_us() : 0;
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
@@ -1598,7 +1614,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (meow_ctx_prof) {
+        const int64_t tp1 = ggml_time_us();
+        ctx_prof.t_reuse += (tp1 - tp0)/1000.0;   // params + reuse check + set_inputs + build/alloc path
+    }
+    const int64_t tc0 = meow_ctx_prof ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (meow_ctx_prof) {
+        const double d = (ggml_time_us() - tc0)/1000.0;
+        ctx_prof.t_compute += d;
+        ctx_prof.n++;
+        if (ubatch.n_tokens > 2) {
+            ctx_prof.v_compute += d;
+            ctx_prof.vn++;
+        }
+        ctx_phase_dump();
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
