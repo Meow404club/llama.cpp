@@ -1,4 +1,5 @@
 #include "gated_delta_net.cuh"
+#include "gated_delta_net_chunked.cuh"
 #include "gated-delta-net-mma.cuh"
 #include "ggml-cuda/common.cuh"
 
@@ -357,6 +358,42 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_d           = cache->data;
         state_slot_stride = cache->slot_stride;
         cache_seq_stride  = cache->seq_stride; // meow(#083e0180f): slot-capacity cache write stride
+    }
+
+    // chunked (WY/UT) path first: the token-by-token kernel below is latency-bound at prefill
+    // batch sizes (AMD-Ecosystem #54: GDN op 220.9 -> 78.5 ms at 2048-token ubatches). Only the
+    // plain state layout (no fused cache write) and scalar gate / single snapshot slot qualify.
+    static const bool gdn_dbg = getenv("GGML_GDN_DEBUG") != nullptr;
+    if (gdn_dbg) {
+        fprintf(stderr, "[gdn] cache=%d kda=%d keep_rs=%d(K=%d) S_v=%lld n_tokens=%lld chunked=%d\n",
+                cache != nullptr, (int) kda, (int) keep_rs, K, (long long) S_v, (long long) n_tokens,
+                (int) ggml_cuda_gdn_chunked_supported(kda, keep_rs, S_v, n_tokens));
+    }
+    if (ggml_cuda_gdn_chunked_supported(kda, keep_rs, S_v, n_tokens)) {
+        ggml_cuda_gdn_chunked_args cargs = {};
+        cargs.q         = q_d;
+        cargs.k         = k_d;
+        cargs.v         = v_d;
+        cargs.g         = g_d;
+        cargs.beta      = b_d;
+        cargs.state_in  = s_d;
+        cargs.dst       = dst_d;
+        cargs.state_out = state_d;
+        cargs.S_v       = S_v;
+        cargs.H         = H;
+        cargs.n_tokens  = n_tokens;
+        cargs.n_seqs    = n_seqs;
+        cargs.sq1 = sq1; cargs.sq2 = sq2; cargs.sq3 = sq3;
+        cargs.sv1 = sv1; cargs.sv2 = sv2; cargs.sv3 = sv3;
+        cargs.sb1 = sb1; cargs.sb2 = sb2; cargs.sb3 = sb3;
+        cargs.neqk1 = neqk1;
+        cargs.rq3   = rq3;
+        // fused-cache write: state_d already points at the cache; give the kernel its
+        // per-sequence stride (0 = the plain [S_v,S_v,H,n_seqs] tail layout)
+        cargs.state_seq_stride = cache != nullptr ? cache->seq_stride : 0;
+        cargs.scale = scale;
+        ggml_cuda_gdn_chunked(ctx, cargs);
+        return;
     }
 
     {
