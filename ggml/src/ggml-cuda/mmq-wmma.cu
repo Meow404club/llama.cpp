@@ -40,19 +40,24 @@ struct WQ4K {
     static constexpr ggml_type type_id = GGML_TYPE_Q4_K;
     using block_t = block_q4_K;
     static __device__ __forceinline__ void frag16(const block_t * __restrict__ blk, const int j0, wmma_half * __restrict__ out) {
-        const int g = j0 >> 5;
+        const int g = j0 >> 5; // 8 groups of 32 (verified: 12B scales = 8x6bit; the bq8_offset/2 in vecdot combines with jm/hi bit tricks to index all 8)
         const float dall = __low2half(blk->dm);
         const float dmin = __high2half(blk->dm);
         uint8_t sc, m;
         wmma_get_scale_min_k4(g, blk->scales, sc, m);
         const float d = dall * sc;
         const float mf = dmin * m;
-        const uint8_t * qs = blk->qs + (j0 >> 1);
+        // meow: nibble layout is BLOCKED, not interleaved (dequantize_row_q4_K):
+        // within each 64-element sub-block, elements 0..31 use the LOW nibbles of bytes 0..31,
+        // elements 32..63 use the HIGH nibbles of the same bytes. The old interleaved read
+        // (out[2k]=low, out[2k+1]=high) produced maxerr ~36 vs the MMVQ reference.
+        const int r0  = (j0 & 31) + ((g & 1) << 5);
+        const bool hi = r0 >= 32;
+        const uint8_t * qs = blk->qs + (g >> 1)*32 + (r0 & 31);
         #pragma unroll
-        for (int k = 0; k < 8; ++k) {
+        for (int k = 0; k < 16; ++k) {
             const uint32_t byte = qs[k];
-            out[2*k + 0] = (wmma_half)(d * (byte & 0xF) - mf);
-            out[2*k + 1] = (wmma_half)(d * (byte >> 4) - mf);
+            out[k] = (wmma_half)(hi ? (d * (byte >> 4) - mf) : (d * (byte & 0xF) - mf));
         }
     }
 };
