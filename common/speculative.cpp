@@ -1247,7 +1247,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const llama_pos pos_arr[4] = { p, p, p, 0 };
                     batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
                 }
+                const int64_t t_inj0 = ggml_time_us(); // meow: eval-boundary attribution
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                {   static long long n = 0; static double sum = 0;
+                    const double ms = (ggml_time_us() - t_inj0) / 1000.0;
+                    sum += ms; n++;
+                    if (n % 8 == 0) { fprintf(stderr, "[spec-prof] inject: %.2f ms avg (n=%lld)\n", sum/n, n); } }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -1317,7 +1322,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
+        const int64_t t_dft0 = ggml_time_us(); // meow: eval-boundary attribution
         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        {   static long long n = 0; static double sum = 0;
+            const double ms = (ggml_time_us() - t_dft0) / 1000.0;
+            sum += ms; n++;
+            if (n % 8 == 0) { fprintf(stderr, "[spec-prof] draft-noise: %.2f ms avg (n=%lld)\n", sum/n, n); } }
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;
