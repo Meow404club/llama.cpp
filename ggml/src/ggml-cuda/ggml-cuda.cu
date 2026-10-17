@@ -4155,6 +4155,35 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // meow(#gatefuse): [ADD(bcast) -> UNARY(softplus/sigmoid/silu) -> MUL(bcast)] - the GDN gate chain
+    static const bool gate_fuse_off = []() { const char * e = getenv("GGML_GATE_FUSE"); return e && atoi(e) == 0; }();
+    if (!gate_fuse_off && node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes) {
+        ggml_tensor * unary_node = cgraph->nodes[i + 1];
+        ggml_tensor * mul_node   = cgraph->nodes[i + 2];
+        if (unary_node->op == GGML_OP_UNARY && unary_node->src[0] == node &&
+                mul_node->op == GGML_OP_MUL && (mul_node->src[0] == unary_node || mul_node->src[1] == unary_node) &&
+                (ggml_get_unary_op(unary_node) == GGML_UNARY_OP_SOFTPLUS ||
+                 ggml_get_unary_op(unary_node) == GGML_UNARY_OP_SIGMOID ||
+                 ggml_get_unary_op(unary_node) == GGML_UNARY_OP_SILU)) {
+            const ggml_tensor * x = node->src[0];
+            const ggml_tensor * b = node->src[1];
+            if (ggml_are_same_shape(b, x)) { x = node->src[1]; b = node->src[0]; }
+            const ggml_tensor * m = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
+            const bool ok_shapes =
+                x->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && m->type == GGML_TYPE_F32 &&
+                unary_node->type == GGML_TYPE_F32 && mul_node->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(x) && ggml_is_contiguous_1(b) && ggml_is_contiguous_1(m) &&
+                ggml_is_contiguous(mul_node) &&
+                b->ne[0] == x->ne[0] && ggml_nrows(b) == 1 &&
+                m->ne[0] == x->ne[0] && ggml_nrows(m) == 1 &&
+                ggml_nelements(mul_node) == ggml_nelements(x);
+            if (ok_shapes) {
+                ggml_cuda_op_add_unary_mul(*cuda_ctx, node, unary_node, mul_node);
+                return 2;
+            }
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
