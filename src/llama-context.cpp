@@ -1542,10 +1542,13 @@ struct ctx_phase_prof_t {
 };
 static ctx_phase_prof_t ctx_prof;
 static inline void ctx_phase_dump() {
-    if (ctx_prof.n > 0 && (ctx_prof.n % 64) == 0) {
+    static const long long ph_every = []() { const char * e = getenv("GGML_CTX_PHASE_EVERY"); return e ? atoll(e) : 64; }();
+    const bool prefill_bucket = ctx_prof.vn > 0 && (ctx_prof.vn % ph_every) == 0;
+    if (prefill_bucket || (ctx_prof.n > 0 && (ctx_prof.n % 64) == 0)) {
         fprintf(stderr, "[ctx-prof] draft-ubatch(ntok<=2): prep=%.3f compute=%.3f (n=%lld) | verify-ubatch(ntok>2): prep=%.3f compute=%.3f (n=%lld)\n",
             ctx_prof.t_reuse/ctx_prof.n + ctx_prof.t_setinp/ctx_prof.n, ctx_prof.t_compute/ctx_prof.n, ctx_prof.n,
             (ctx_prof.v_reuse + ctx_prof.v_setinp)/(ctx_prof.vn ? ctx_prof.vn : 1), ctx_prof.v_compute/(ctx_prof.vn ? ctx_prof.vn : 1), ctx_prof.vn);
+        if (prefill_bucket) { ctx_prof.v_reuse = ctx_prof.v_setinp = ctx_prof.v_compute = 0; ctx_prof.vn = 0; }
     }
 }
 

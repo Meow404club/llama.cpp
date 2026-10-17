@@ -5307,6 +5307,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
+            // meow: prefill graphs. Prefill evals always differ (KV view offsets + FA op
+            // params move every ubatch), so the stock 2-identical-calls warmup can never
+            // complete and every ubatch pays ~4k per-node WDDM submissions (measured: op
+            // execution is only ~45% of prefill wall). GGML_PREFILL_GRAPHS=1 forces graph
+            // mode after the first eval: each ubatch is re-captured, cudaGraphExecUpdate
+            // patches the changed node params, and a single replay replaces all launches.
+            static const bool prefill_graphs = []() {
+                const char * e = getenv("GGML_PREFILL_GRAPHS");
+                return e != nullptr && std::atoi(e) != 0;
+            }();
+            static std::unordered_map<const void *, int> prefill_graph_calls;
+
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
@@ -5316,15 +5328,29 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     }
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
+                } else if (prefill_graphs && ++prefill_graph_calls[graph_key] >= 2) {
+                    graph->warmup_complete   = true;
+                    use_cuda_graph             = true;
+                    cuda_graph_update_required = true;
+                    if (ggml_cuda_graph_debug_enabled()) {
+                        fprintf(stderr, "[cg-dbg] prefill graphs: forced capture at call %d\n",
+                                prefill_graph_calls[graph_key]);
+                    }
                 }
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
                 // Post-warmup: normal CUDA graph operation
                 if (properties_changed) {
+                    if (prefill_graphs) {
+                        // patch + replay instead of resetting: prefill props always change
+                        use_cuda_graph             = true;
+                        cuda_graph_update_required = true;
+                    } else {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
                     if (ggml_cuda_graph_debug_enabled()) {
                         GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    }
                     }
                 } else {
                     use_cuda_graph = true;
