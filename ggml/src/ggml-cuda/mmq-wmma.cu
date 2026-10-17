@@ -62,6 +62,31 @@ struct WQ4K {
     }
 };
 
+struct WQ6K {
+    static constexpr ggml_type type_id = GGML_TYPE_Q6_K;
+    using block_t = block_q6_K;
+    // layout per dequantize_q6_K (dequantize.cuh, 64-thread form): element e of a 256-block
+    // with ip = e>>7, quarter q = (e>>5)&3, l = e&31 reads ql[64*ip + (q&1)*32 + l],
+    // qh[32*ip + l], scale scales[8*ip + l/16]. Within a 16-run (j0 % 16 == 0) ip, quarter
+    // and scale index are constant.
+    static __device__ __forceinline__ void frag16(const block_t * __restrict__ blk, const int j0, wmma_half * __restrict__ out) {
+        const int ip  = j0 >> 7;
+        const int qtr = (j0 >> 5) & 3;
+        const int l0  = j0 & 31;
+        const float d = blk->d;
+        const uint8_t * ql = blk->ql + 64*ip + (qtr & 1)*32 + l0;
+        const uint8_t * qh = blk->qh + 32*ip + l0;
+        const int8_t   sc = blk->scales[8*ip + (l0 >> 4)];
+        const float ds = d * sc;
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            uint32_t q = (qtr < 2) ? (ql[k] & 0xF) : (ql[k] >> 4);
+            q |= ((qh[k] >> (2*qtr)) & 3) << 4;
+            out[k] = (wmma_half)(ds * ((int) q - 32));
+        }
+    }
+};
+
 struct WIQ3S {
     static constexpr ggml_type type_id = GGML_TYPE_IQ3_S;
     using block_t = block_iq3_s;
@@ -934,7 +959,7 @@ public:
 
 // B-side dequant fragment (probe/dq_fragment): stages whole 16-k segments of weight rows,
 // one WQ4K::frag16 dequant per 16 halves; LDS tile layout [n][k] = col-major B convention.
-template<int BLOCK_K, int BLOCK_N, int PADDING, int BLOCK_SIZE>
+template<int BLOCK_K, int BLOCK_N, int PADDING, int BLOCK_SIZE, typename DQ>
 struct dq_fragment {
     static constexpr int segs_per_row       = BLOCK_K / 16;
     static constexpr int vectors_per_thread = (BLOCK_N * segs_per_row + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -958,7 +983,7 @@ struct dq_fragment {
         const int gr = wrow0 + r;
         if (r < BLOCK_N && gr < Nlim) {
             const int j0 = (seg + s) * 16;
-            WQ4K::frag16((const block_q4_K *)(row_base + (size_t)r * wstride) + (j0 >> 8), j0 & 255, (wmma_half *)&regs[v]);
+            DQ::frag16((const typename DQ::block_t *)(row_base + (size_t)r * wstride) + (j0 >> 8), j0 & 255, (wmma_half *)&regs[v]);
         } else {
             regs[v] = (wmma_half16)0.f;
         }
@@ -1007,7 +1032,8 @@ template<class T,
          int      single_buffer,
          int      swizzle,
          int      bits,
-         int      is_aligned>
+         int      is_aligned,
+         typename DQ>
 __device__ __forceinline__ void gemm_impl_dq(
     T* __restrict__ C, const U* __restrict__ A, const char* wq, int M, int N, int K, size_t w_stride)
 {
@@ -1074,7 +1100,7 @@ __device__ __forceinline__ void gemm_impl_dq(
     // Constructor builds the SRD once from the matrix base + allocation size.
     prefetch_fragment<LAYOUT_A, bits, full_block, block_m, block_k, padding_a, U> regs_a(
         A, static_cast<unsigned>(M) * static_cast<unsigned>(K));
-    dq_fragment<block_k, block_n, padding_b, warps_m * warps_n * 32> regs_b(wq, w_stride, block_col, N);
+    dq_fragment<block_k, block_n, padding_b, warps_m * warps_n * 32, DQ> regs_b(wq, w_stride, block_col, N);
 
     const U* A_tile_ptr = A_base;
 
@@ -1401,7 +1427,7 @@ x_stage_f16col(const float* __restrict__ x, size_t x_stride, __half * __restrict
 // (staged), B Q4_K native. block_m 256 halves the B(weight)-side re-reads: 69.5-72.8 TF
 // across the model's real shapes vs 63-67 at block_m 128 (A-side re-reads are cheaper: the
 // staged x16 panels are contiguous 256B bursts).
-template<bool IS_ALIGNED>
+template<bool IS_ALIGNED, typename DQ>
 static __global__ void __launch_bounds__(256)
 mul_mat_wmma_dq_kernel(float * __restrict__ dst, const __half * __restrict__ x16,
                        const char * __restrict__ wq, size_t w_stride,
@@ -1409,8 +1435,8 @@ mul_mat_wmma_dq_kernel(float * __restrict__ dst, const __half * __restrict__ x16
     rwg::gemm_impl_dq<float, __half,
                       rwg::m_layout::row_major,  // C: ggml dst (m,n) at m*N+n
                       rwg::m_layout::col_major,  // A: x staged as [K][M] f16
-                      rwg::m_layout::col_major,  // B: Q4_K weights [N][K]
-                      2, 4, 8, 2, 1, 0, 8, 256, IS_ALIGNED>(dst, x16, wq, M, N, K, w_stride);
+                      rwg::m_layout::col_major,  // B: quantized weights [N][K]
+                      2, 4, 8, 2, 1, 0, 8, 256, IS_ALIGNED, DQ>(dst, x16, wq, M, N, K, w_stride);
 }
 
 // v4 entry: stage x -> f16 [K][M], then the spliced gemm. The staging pass costs ~296/N % of
@@ -1435,10 +1461,18 @@ static void mul_mat_wmma_dq(ggml_backend_cuda_context & ctx, const ggml_tensor *
     }
 
     const int grid = ((M + 255) / 256) * ((N + 127) / 128);
-    if ((M % 256) == 0 && (N % 128) == 0) {
-        mul_mat_wmma_dq_kernel<true><<<grid, 256, 0, stream>>>((float *)dst->data, x16.ptr, (const char *)src0->data, src0->nb[1], M, N, K);
+    if (src0->type == GGML_TYPE_Q6_K) {
+        if ((M % 256) == 0 && (N % 128) == 0) {
+            mul_mat_wmma_dq_kernel<true, WQ6K><<<grid, 256, 0, stream>>>((float *)dst->data, x16.ptr, (const char *)src0->data, src0->nb[1], M, N, K);
+        } else {
+            mul_mat_wmma_dq_kernel<false, WQ6K><<<grid, 256, 0, stream>>>((float *)dst->data, x16.ptr, (const char *)src0->data, src0->nb[1], M, N, K);
+        }
     } else {
-        mul_mat_wmma_dq_kernel<false><<<grid, 256, 0, stream>>>((float *)dst->data, x16.ptr, (const char *)src0->data, src0->nb[1], M, N, K);
+        if ((M % 256) == 0 && (N % 128) == 0) {
+            mul_mat_wmma_dq_kernel<true, WQ4K><<<grid, 256, 0, stream>>>((float *)dst->data, x16.ptr, (const char *)src0->data, src0->nb[1], M, N, K);
+        } else {
+            mul_mat_wmma_dq_kernel<false, WQ4K><<<grid, 256, 0, stream>>>((float *)dst->data, x16.ptr, (const char *)src0->data, src0->nb[1], M, N, K);
+        }
     }
 }
 
@@ -1453,7 +1487,9 @@ void ggml_cuda_mul_mat_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor *
     // routing measured best end-to-end, +0.8-1.3% across pp512..pp131072).
     static const int dq_mode   = []() { const char * e = getenv("GGML_MMQ_WMMA"); return e ? atoi(e) : 0; }();
     static const int dq_nmin   = []() { const char * e = getenv("GGML_MMQ_WMMA_DQ_NMIN"); return e ? atoi(e) : 0; }();
-    if (dq_mode == 2 && src0->type == GGML_TYPE_Q4_K && M > 16 && N >= dq_nmin) {
+    static const bool dq_q6 = []() { const char * e = getenv("GGML_MMQ_WMMA_Q6"); return e ? atoi(e) != 0 : false; }();
+    if (dq_mode == 2 && M > 16 && N >= dq_nmin &&
+        (src0->type == GGML_TYPE_Q4_K || (src0->type == GGML_TYPE_Q6_K && dq_q6))) {
         mul_mat_wmma_dq(ctx, src0, src1, dst, (int)M, (int)N, (int)K);
         return;
     }
@@ -1479,7 +1515,7 @@ void ggml_cuda_mul_mat_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor *
 
 bool ggml_cuda_should_use_wmma(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int cc, const int64_t ne11) {
     if (!GGML_CUDA_CC_IS_RDNA3(cc)) return false;
-    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_IQ3_S) return false;
+    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_IQ3_S && src0->type != GGML_TYPE_Q6_K) return false;
     if (src1->type != GGML_TYPE_F32 || src1->nb[0] != sizeof(float)) return false;
     if (!ggml_is_contiguous(src0)) return false;
     if (src0->ne[0] % 256 != 0) return false;
@@ -1507,7 +1543,10 @@ bool ggml_cuda_should_use_wmma(const ggml_tensor * src0, const ggml_tensor * src
         const char * e = getenv("GGML_MMQ_WMMA");
         return e ? atoi(e) : 0;
     }();
-    if (big_mode == 2) return src0->type == GGML_TYPE_Q4_K;
+    if (big_mode == 2) {
+        static const bool dq_q6 = []() { const char * e = getenv("GGML_MMQ_WMMA_Q6"); return e ? atoi(e) != 0 : false; }();
+        return src0->type == GGML_TYPE_Q4_K || (src0->type == GGML_TYPE_Q6_K && dq_q6);
+    }
     return big_mode != 0;
 }
 
