@@ -4945,6 +4945,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     };
 
+    // meow: op profiler state (hoisted so fused dispatches inside ggml_cuda_try_fuse can be timed too)
+    static const bool prof_enabled = (getenv("GGML_CUDA_PROFILE") != nullptr) && !use_cuda_graph;
+    static const int prof_every = []() {
+        const char * e = getenv("GGML_CUDA_PROFILE_EVERY");
+        return e ? std::max(1, atoi(e)) : 48;
+    }();
+    struct prof_state_t {
+        std::vector<cudaEvent_t> ev_start, ev_stop;
+        std::vector<std::pair<int, ggml_op>> pending; // node idx + op recorded last time
+        std::vector<std::string> names;
+        std::unordered_map<ggml_op, double> ms;
+        std::unordered_map<ggml_op, int>    cnt;
+        std::unordered_map<std::string, std::pair<double,int>> ms_name;
+        long long evals = 0;
+        long long instr = 0;
+        long long drained = 0;
+        long long win = 0; // meow: evals since last dump (per-window means)
+    };
+    static prof_state_t st;
+    static bool prof_new_eval_pending = false;
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
@@ -5055,6 +5075,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                const bool fuse_instr = prof_enabled && (st.evals % prof_every == 0);
+                if (fuse_instr) { // meow: fused groups dispatch inside try_fuse - bracket them with events
+                    if ((int) st.ev_start.size() <= i) { st.ev_start.resize(i + 1); st.ev_stop.resize(i + 1); }
+                    if (st.ev_start[i] == nullptr) {
+                        cudaEventCreateWithFlags(&st.ev_start[i], 0);
+                        cudaEventCreateWithFlags(&st.ev_stop[i], 0);
+                    }
+                    if ((int) st.names.size() <= i) st.names.resize(i + 1);
+                    st.names[i] = node->name ? node->name : "?";
+                    CUDA_CHECK(cudaEventRecord(st.ev_start[i], cuda_ctx->stream()));
+                }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -5078,7 +5109,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             }
                         }
                     }
-                    i += nodes_to_skip;
+                if (fuse_instr && nodes_to_skip != 0) {
+                    CUDA_CHECK(cudaEventRecord(st.ev_stop[i], cuda_ctx->stream()));
+                    st.pending.push_back({i, node->op});
+                }                    i += nodes_to_skip;
                     continue;
                 }
 #ifndef NDEBUG
@@ -5118,22 +5152,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // GGML_CUDA_PROFILE_EVERY (default 48) and drains the previous
                 // instrumented eval's events at the next one - by then the GPU has
                 // long passed them, so no synchronization ever stalls the pipeline.
-                static const bool prof_enabled = (getenv("GGML_CUDA_PROFILE") != nullptr) && !use_cuda_graph;
-                static const int prof_every = []() {
-                    const char * e = getenv("GGML_CUDA_PROFILE_EVERY");
-                    return e ? std::max(1, atoi(e)) : 48;
-                }();
-                struct prof_state_t {
-                    std::vector<cudaEvent_t> ev_start, ev_stop;
-                    std::vector<std::pair<int, ggml_op>> pending; // node idx + op recorded last time
-                    std::vector<std::string> names;                    std::unordered_map<ggml_op, double> ms;
-                    std::unordered_map<ggml_op, int>    cnt;
-                    std::unordered_map<std::string, std::pair<double,int>> ms_name;                    long long evals = 0;       // all graph computes
-                    long long instr = 0;       // instrumented evals
-                    long long drained = 0;     // drained instrumented evals
-                };
-                static prof_state_t st;
-                static bool prof_new_eval_pending = false;
                 if (ggml_prof_new_eval) {
                     ggml_prof_new_eval = false;
                     st.evals++;
@@ -5157,13 +5175,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 }
                             }
                         }
-                        st.drained++;
+                        st.drained++; st.win++;
                         st.pending.clear();
-                        if (st.drained % 4 == 0) {
+                        if (true) { // meow: per-eval dump (every drain), stats reset after
                             fprintf(stderr, "[prof] op timing per eval, mean of %lld evals (ms):\n", st.drained);
                             std::vector<std::pair<double, ggml_op>> sorted;
                             for (auto & kv : st.ms) {
-                                sorted.push_back({kv.second / st.drained, kv.first});
+                                sorted.push_back({kv.second / (st.win ? st.win : 1), kv.first});
                             }
                             std::sort(sorted.begin(), sorted.end(),
                                       [](const auto & a, const auto & b) { return a.first > b.first; });
@@ -5178,14 +5196,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             fprintf(stderr, "[prof]   %-24s %8.4f ms/eval\n", "TOTAL(sum)", total);
                             {
                                 std::vector<std::pair<double, std::string>> sn;
-                                for (auto & kv : st.ms_name) sn.push_back({kv.second.first / st.drained, kv.first});
+                                for (auto & kv : st.ms_name) sn.push_back({kv.second.first / (st.win ? st.win : 1), kv.first});
                                 std::sort(sn.begin(), sn.end(), [](const auto & a, const auto & b){ return a.first > b.first; });
                                 for (size_t k = 0; k < sn.size() && k < 10; ++k) {
                                     fprintf(stderr, "[prof]   %-40s %8.4f ms/eval x %d\n", sn[k].second.c_str(), sn[k].first,
-                                            (int)(st.ms_name[sn[k].second].second / st.drained));
+                                            (int)(st.ms_name[sn[k].second].second / (st.win ? st.win : 1)));
                                 }
                             }
-                            st.ms.clear(); st.cnt.clear(); st.ms_name.clear(); // meow: per-window stats, not cumulative
+                            st.ms.clear(); st.cnt.clear(); st.ms_name.clear(); st.win = 0; // meow: per-window stats, not cumulative
                         }
                     }
                     }
