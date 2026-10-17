@@ -5317,11 +5317,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         }
-        if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        { // meow: replay cost attribution (env-gated)
+            static const bool on = getenv("GGML_GRAPH_REPLAY_PROF") != nullptr;
+            static long long n = 0; static double t_up = 0, t_lu = 0;
+            const int64_t t0 = on ? ggml_time_us() : 0;
+            if (cuda_graph_update_required) { // Update graph executable
+                ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            }
+            const int64_t t1 = on ? ggml_time_us() : 0;
+            // Launch graph
+            CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+            if (on) {
+                const int64_t t2 = ggml_time_us();
+                t_up += (t1 - t0) / 1000.0; t_lu += (t2 - t1) / 1000.0; n++;
+                if (n % 8 == 0) {
+                    fprintf(stderr, "[replay-prof] update %.3f ms, launch %.3f ms per eval (n=%lld)\n", t_up/n, t_lu/n, n);
+                }
+            }
         }
-        // Launch graph
-        CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
