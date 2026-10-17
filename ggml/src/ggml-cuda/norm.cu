@@ -608,7 +608,22 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
 
+    static const bool norm_time = getenv("GGML_NORM_TIME") != nullptr; // meow: decode-path self timer
+    hipEvent_t nt0 = nullptr, nt1 = nullptr;
+    if (norm_time) { hipEventCreate(&nt0); hipEventCreate(&nt1); hipEventRecord(nt0, stream); }
     rms_norm_f32_cuda(src0, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+    if (norm_time) {
+        hipEventRecord(nt1, stream);
+        hipEventSynchronize(nt1);
+        static long long nn = 0; static double nsum = 0;
+        float nms = 0.0f;
+        hipEventElapsedTime(&nms, nt0, nt1);
+        nsum += nms; nn++;
+        if (nn % 64 == 0) {
+            fprintf(stderr, "[norm-time] rms_norm plain: %.3f ms avg (n=%lld) last ncols=%lld nrows=%lld x %lld\n", nsum/nn, nn, (long long)ne00, (long long)ne01, (long long)(ne02*ne03));
+        }
+        hipEventDestroy(nt0); hipEventDestroy(nt1);
+    }
 }
 
 void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor) {
@@ -683,6 +698,9 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
 
+    static const bool norm_time = getenv("GGML_NORM_TIME") != nullptr; // meow: decode-path self timer
+    hipEvent_t nt0 = nullptr, nt1 = nullptr;
+    if (norm_time) { hipEventCreate(&nt0); hipEventCreate(&nt1); hipEventRecord(nt0, stream); }
     rms_norm_mul_f32_cuda(rms_norm_src, mul_src, nullptr, dst_d,
                           ne00, ne01, ne02, ne03,
                           /*s00*/ s01, s02, s03,
@@ -691,6 +709,18 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
                           eps, stream);
+    if (norm_time) {
+        hipEventRecord(nt1, stream);
+        hipEventSynchronize(nt1);
+        static long long nn = 0; static double nsum = 0;
+        float nms = 0.0f;
+        hipEventElapsedTime(&nms, nt0, nt1);
+        nsum += nms; nn++;
+        if (nn % 64 == 0) {
+            fprintf(stderr, "[norm-time] rms_norm+mul: %.3f ms avg (n=%lld) last ncols=%lld nrows=%lld x %lld\n", nsum/nn, nn, (long long)ne00, (long long)ne01, (long long)(ne02*ne03));
+        }
+        hipEventDestroy(nt0); hipEventDestroy(nt1);
+    }
 }
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
