@@ -1010,6 +1010,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
 
+    // meow(#merge): fuse the post-verify feature injection into the next noise-block eval.
+    // process() stashes the gathered features instead of running a standalone inject eval;
+    // draft() prepends them to the noise batch so one graph covers both (dflash graph<false>
+    // mixed branch). env LLAMA_DFLASH_MERGE=0 restores the two-pass behavior.
+    bool merge_eval = false;
+    std::vector<std::vector<float>>   pend_feats; // [n_seq][n_rows * n_embd_enc]
+    std::vector<std::vector<llama_pos>> pend_pos; // [n_seq][n_rows], empty = no stash
+
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
@@ -1138,6 +1146,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
+
+        // meow(#merge): fused inject+noise eval - numerically bit-exact with the two-pass
+        // flow (greedy SHA + acceptance verified identical), but the single merged graph
+        // costs ~+3.5 ms more host/launch than the two smaller evals save in boundary, so
+        // it nets ~+2 ms/step. Opt-in only (LLAMA_DFLASH_MERGE=1) until that is understood.
+        merge_eval = false;
+        if (const char * env = getenv("LLAMA_DFLASH_MERGE")) {
+            merge_eval = is_dflash2 && !is_lilicorr && std::atoi(env) != 0;
+        }
+        if (merge_eval) {
+            pend_feats.resize(n_seq);
+            pend_pos.resize(n_seq);
+        }
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1185,6 +1206,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const bool has_embeddings = batch_in.has_embd();
         if (has_tokens == has_embeddings) {
             return true;
+        }
+
+        static const bool merge_dbg = getenv("LLAMA_DFLASH_MERGE_DBG") != nullptr; // meow(#merge)
+        if (merge_dbg) {
+            fprintf(stderr, "[merge-dbg] process: n=%d pos[%d..%d] seq=%d embd=%d\n",
+                    (int) batch_in.size(), (int) batch_in.tokens.front().pos[0],
+                    (int) batch_in.tokens.back().pos[0], (int) batch_in.tokens.front().seq_id, (int) has_embeddings);
         }
 
         const int32_t n_tokens = batch_in.size();
@@ -1241,6 +1269,52 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
+                // meow(#merge): stash the gathered rows and let the next draft() prepend them
+                // to the noise block - one eval covers both. Only for the steady-state shape:
+                // a single sequence, the whole batch in one chunk, room left for the noise
+                // block, and a clean feature row layout.
+                const bool can_merge = merge_eval && n_seq == 1 && seq_id == 0 &&
+                                       n_rows <= n_ubatch && offset == 0 && n_rows == n_tokens &&
+                                       n_tokens + params.n_max + 1 <= n_ubatch;
+                if (can_merge) {
+                    // an unconsumed stash means no draft() ran since (e.g. the prompt decode
+                    // followed by the first sampled token) - flush it through the standalone
+                    // inject eval before overwriting, or its rows would never reach the cache
+                    const bool pend_stale = !pend_pos[seq_id].empty() &&
+                        pend_pos[seq_id].back() + 1 != batch_in.tokens[i_batch_beg[seq_id] + offset].pos[0];
+                    if (pend_stale) {
+                        pend_pos[seq_id].clear(); // leftover from another task - drop it
+                    }
+                    if (!pend_pos[seq_id].empty()) {
+                        batch_inject.clear();
+                        for (size_t i = 0; i < pend_pos[seq_id].size(); ++i) {
+                            const llama_pos p = pend_pos[seq_id][i];
+                            const llama_pos pos_arr[4] = { p, p, p, 0 };
+                            batch_inject.add_embd({ pend_feats[seq_id].data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+                        }
+                        const int64_t t_inj0 = ggml_time_us(); // meow: eval-boundary attribution
+                        const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                        {   static long long n = 0; static double sum = 0;
+                            const double ms = (ggml_time_us() - t_inj0) / 1000.0;
+                            sum += ms; n++;
+                            if (n % 8 == 0) { fprintf(stderr, "[spec-prof] inject(flush): %.2f ms avg (n=%lld)\n", sum/n, n); } }
+                        if (rc != 0) {
+                            LOG_ERR("%s: stash-flush llama_process(ctx_dft) failed rc=%d\n", __func__, rc);
+                            return false;
+                        }
+                        pend_pos[seq_id].clear();
+                    }
+                    pend_feats[seq_id].assign(features_buf.begin(), features_buf.begin() + (size_t) n_chunk * n_embd_enc);
+                    pend_pos[seq_id].resize(n_chunk);
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        pend_pos[seq_id][i] = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
+                    }
+                    continue;
+                }
+                if (seq_id < (llama_seq_id) pend_pos.size()) {
+                    pend_pos[seq_id].clear(); // standalone path ran instead - drop any stale stash
+                }
+
                 batch_inject.clear();
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
@@ -1285,6 +1359,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        static const bool merge_dbg = getenv("LLAMA_DFLASH_MERGE_DBG") != nullptr; // meow(#merge)
+
         batch.clear();
 
         // build one batch holding every drafting sequence's noise block into a single decode)
@@ -1304,6 +1380,46 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n_draft = params.n_max;
             const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+
+            // meow(#merge): prepend the stashed inject rows - the fused eval runs feature
+            // injection and the noise block as one graph (dflash graph<false> mixed branch),
+            // saving one full eval boundary per step. Stash rows at or past the noise start
+            // belong to rejected drafts and cannot ride along (batch positions must not
+            // decrease), so flush them through the standalone inject eval instead - the
+            // unfused two-pass flow, bit-for-bit.
+            if (seq_id < (llama_seq_id) pend_pos.size() && !pend_pos[seq_id].empty()) {
+                auto & pp = pend_pos[seq_id];
+                if (merge_dbg) {
+                    fprintf(stderr, "[merge-dbg] draft: pos0=%d pend=%d pend_pos[%d..%d] %s\n",
+                            (int) dp.pos0, (int) pp.size(), (int) pp.front(), (int) pp.back(),
+                            pp.back() < dp.pos0 ? "MERGED" : "FLUSH");
+                }
+                if (pp.back() < dp.pos0) {
+                    for (size_t i = 0; i < pp.size(); ++i) {
+                        const llama_pos p = pp[i];
+                        const llama_pos pos_arr[4] = { p, p, p, 0 };
+                        batch.add_embd({ pend_feats[seq_id].data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+                    }
+                } else {
+                    batch_inject.clear();
+                    for (size_t i = 0; i < pp.size() && pp[i] < dp.pos0; ++i) {
+                        const llama_pos p = pp[i];
+                        const llama_pos pos_arr[4] = { p, p, p, 0 };
+                        batch_inject.add_embd({ pend_feats[seq_id].data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+                    }
+                    const int64_t t_inj0 = ggml_time_us(); // meow: eval-boundary attribution
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                    {   static long long n = 0; static double sum = 0;
+                        const double ms = (ggml_time_us() - t_inj0) / 1000.0;
+                        sum += ms; n++;
+                        if (n % 8 == 0) { fprintf(stderr, "[spec-prof] inject(flush): %.2f ms avg (n=%lld)\n", sum/n, n); } }
+                    if (rc != 0) {
+                        LOG_WRN("%s: flush llama_process(ctx_dft) failed rc=%d\n", __func__, rc);
+                    }
+                }
+                pend_pos[seq_id].clear();
+            }
+
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -1323,10 +1439,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // decode all sequence's noise block in a single batch
         const int64_t t_dft0 = ggml_time_us(); // meow: eval-boundary attribution
+        const int32_t rows_dbg = (int32_t) batch.size();
         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         {   static long long n = 0; static double sum = 0;
             const double ms = (ggml_time_us() - t_dft0) / 1000.0;
             sum += ms; n++;
+            if (merge_dbg) { fprintf(stderr, "[spec-prof] draft-eval: %.3f ms rows=%d\n", ms, rows_dbg); }
             if (n % 8 == 0) { fprintf(stderr, "[spec-prof] draft-noise: %.2f ms avg (n=%lld)\n", sum/n, n); } }
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
@@ -1377,6 +1495,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
+                }
+                if (getenv("LLAMA_DFLASH_MERGE_DBG")) { // meow(#merge)
+                    fprintf(stderr, "[merge-dbg] lattice: seq=%d n_block=%d n_draft=%d\n",
+                            (int) seq_id, (int) n_block_tokens, (int) result.size());
                 }
                 continue;
             }
