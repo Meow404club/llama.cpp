@@ -588,6 +588,101 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     group_norm_f32_cuda(src0_d, dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
 }
 
+
+// meow(#normbatch): batch N independent rms_norm(+scale/+mul) ops into one launch.
+// Per-row arithmetic is copied verbatim from rms_norm_f32 (contiguous specialization),
+// so results are bit-identical to the stock single-op launches. Struct defs in norm.cuh.
+
+template <int block_size, int vpt>
+static __global__ void rms_norm_batch_f32(ggml_cuda_rms_batch_t b) {
+    const int row_g = blockIdx.x;
+    const ggml_cuda_rms_batch_item_t * it = nullptr;
+    for (int k = 0; k < b.n; ++k) {
+        if (row_g < b.it[k].row_beg + b.it[k].nrows) { it = &b.it[k]; break; }
+    }
+    if (it == nullptr) { return; }
+    const int row = row_g - it->row_beg;
+    const int tid = threadIdx.x;
+    const int ncols = it->ncols;
+
+    extern __shared__ float s_sum[];
+
+    ggml_cuda_pdl_sync();
+
+    const float * xc = it->src + (int64_t) row * ncols;
+    float       * dstc = it->dst + (int64_t) row * ncols;
+
+    const bool do_mul_v = it->mul != nullptr;
+    const bool do_scale_v = it->scale_out != 1.0f;
+
+    const int      ncols4 = ncols / 4;
+    const float4 * x4     = (const float4 *) xc;
+    const float4 * mul4   = (const float4 *) it->mul;
+    float4 *       dst4   = (float4 *) dstc;
+
+    float4 xs[vpt];
+    float  tmp = 0.0f;
+
+    #pragma unroll
+    for (int k = 0; k < vpt; k++) {
+        const int i = tid + k*block_size;
+        if (i < ncols4) {
+            xs[k] = x4[i];
+            tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+        }
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + it->eps);
+
+    #pragma unroll
+    for (int k = 0; k < vpt; k++) {
+        const int i = tid + k*block_size;
+        if (i < ncols4) {
+            float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
+            if (do_mul_v) {
+                const float4 m = mul4[i];
+                r.x *= m.x; r.y *= m.y; r.z *= m.z; r.w *= m.w;
+            }
+            if (do_scale_v) {
+                r.x *= it->scale_out; r.y *= it->scale_out; r.z *= it->scale_out; r.w *= it->scale_out;
+            }
+            dst4[i] = r;
+        }
+    }
+
+    if constexpr (block_size > WARP_SIZE) {
+        __syncthreads();
+    }
+}
+
+void ggml_cuda_op_rms_norm_batch(ggml_backend_cuda_context & ctx, const ggml_cuda_rms_batch_t & b_in, cudaStream_t stream) {
+    GGML_UNUSED(ctx);
+    ggml_cuda_rms_batch_t b = b_in;
+    int total_rows = 0;
+    for (int k = 0; k < b.n; ++k) {
+        b.it[k].row_beg = total_rows;
+        total_rows += b.it[k].nrows;
+    }
+    const int ncols = b.it[0].ncols;
+    const int n4 = ncols / 4;
+    // same block/vpt table as rms_norm_f32_dispatch's vec path
+    if (n4 <= 32) {
+        rms_norm_batch_f32<32, 1><<<total_rows, 32, 0, stream>>>(b);
+    } else if (n4 <= 128) {
+        rms_norm_batch_f32<128, 1><<<total_rows, 128, 0, stream>>>(b);
+    } else if (n4 <= 256) {
+        rms_norm_batch_f32<256, 1><<<total_rows, 256, 0, stream>>>(b);
+    } else if (n4 <= 512) {
+        rms_norm_batch_f32<512, 1><<<total_rows, 512, 0, stream>>>(b);
+    } else if (n4 <= 1024) {
+        rms_norm_batch_f32<1024, 1><<<total_rows, 1024, 0, stream>>>(b);
+    } else if (n4 <= 4096) {
+        rms_norm_batch_f32<1024, 4><<<total_rows, 1024, 0, stream>>>(b);
+    } else {
+        GGML_ABORT("norm batch: ncols too large");
+    }
+}
+
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     float * dst_d = (float *) dst->data;

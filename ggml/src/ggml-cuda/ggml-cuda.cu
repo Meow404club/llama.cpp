@@ -3856,6 +3856,153 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// meow(#normbatch): collect upcoming independent rms_norm(+scale/+mul) ops into one launch.
+// Eligibility reuses ggml_cuda_can_fuse for the epilogue pairs; inputs must already be
+// produced (no producer between the anchor and the candidate). Handled nodes drop their
+// COMPUTE flag so the main loop skips them.
+static int ggml_cuda_try_norm_batch(ggml_backend_cuda_context & cuda_ctx, ggml_cgraph * cgraph, int i, int max_items) {
+    ggml_cuda_rms_batch_t b = {};
+    std::vector<int> handled;
+    handled.reserve(2*8);
+
+    auto classify = [&](int j, ggml_cuda_rms_batch_item_t & it) -> int {
+        // returns: -1 ineligible, 0 plain, 1 with epilogue at j+1
+        ggml_tensor * n = cgraph->nodes[j];
+        ggml_tensor * x = n->src[0];
+        if (x->type != GGML_TYPE_F32 || n->type != GGML_TYPE_F32) return -1;
+        if (x->ne[2] != 1 || x->ne[3] != 1) return -1;
+        if (!ggml_is_contiguous(x)) return -1;
+        if (x->ne[0] % 4 != 0) return -1; // batch kernel is vec-only
+        const int ncols = (int) x->ne[0];
+        const int nrows = (int) x->ne[1];
+        ggml_tensor * next = (j + 1 < cgraph->n_nodes) ? cgraph->nodes[j + 1] : nullptr;
+        if (next && next->op == GGML_OP_SCALE && next->src[0] == n) {
+            if (ggml_cuda_can_fuse(cgraph, j, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
+                float s;
+                memcpy(&s, (const float *) next->op_params, sizeof(float));
+                if (!ggml_is_contiguous(next) || ((uintptr_t) next->data & 15) != 0) return -1;
+                it.src = (const float *) x->data;
+                it.dst = (float *) next->data;
+                it.mul = nullptr;
+                it.scale_out = s;
+                memcpy(&it.eps, n->op_params, sizeof(float));
+                it.ncols = ncols;
+                it.nrows = nrows;
+                return 1;
+            }
+        }
+        if (next && next->op == GGML_OP_MUL && (next->src[0] == n || next->src[1] == n)) {
+            if (ggml_cuda_can_fuse(cgraph, j, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+                ggml_tensor * m = next->src[0] == n ? next->src[1] : next->src[0];
+                if (m->type == GGML_TYPE_F32 && m->ne[0] == ncols && m->ne[1] == 1 &&
+                        ggml_is_contiguous(m) && ggml_is_contiguous(next) &&
+                        ((uintptr_t) next->data & 15) == 0) {
+                    it.src = (const float *) x->data;
+                    it.dst = (float *) next->data;
+                    it.mul = (const float *) m->data;
+                    it.scale_out = 1.0f;
+                    memcpy(&it.eps, n->op_params, sizeof(float));
+                    it.ncols = ncols;
+                    it.nrows = nrows;
+                    return 1;
+                }
+            }
+        }
+        // plain: dst = the rms_norm result itself
+        if (!ggml_is_contiguous(n) || ((uintptr_t) n->data & 15) != 0) return -1;
+        it.src = (const float *) x->data;
+        it.dst = (float *) n->data;
+        it.mul = nullptr;
+        it.scale_out = 1.0f;
+        memcpy(&it.eps, n->op_params, sizeof(float));
+        it.ncols = ncols;
+        it.nrows = nrows;
+        return 0;
+    };
+
+    ggml_cuda_rms_batch_item_t it0 = {};
+    const int kind0 = classify(i, it0);
+    if (kind0 < 0) {
+        return 0;
+    }
+    // src/dst 16B alignment for the vec path
+    if (((uintptr_t) it0.src & 15) != 0) {
+        return 0;
+    }
+    b.it[b.n++] = it0;
+    handled.push_back(i);
+    if (kind0 == 1) {
+        handled.push_back(i + 1);
+    }
+
+    const int lookahead = 512;
+    for (int j = i + 1; j < cgraph->n_nodes && j < i + lookahead && b.n < max_items && b.n < 8; ++j) {
+        ggml_tensor * cand = cgraph->nodes[j];
+        if (cand->op != GGML_OP_RMS_NORM) {
+            continue;
+        }
+        if ((cand->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        // inputs must be ready: no producer of the candidate's src between i and j
+        ggml_tensor * x = cand->src[0];
+        bool ready = true;
+        for (int k = i + 1; k < j; ++k) {
+            if (cgraph->nodes[k] == x) { ready = false; break; }
+        }
+        if (!ready) {
+            continue;
+        }
+        ggml_cuda_rms_batch_item_t it = {};
+        const int kind = classify(j, it);
+        if (kind < 0) {
+            continue;
+        }
+        // same geometry class only
+        if (it.ncols != it0.ncols) {
+            continue;
+        }
+        if (((uintptr_t) it.src & 15) != 0) {
+            continue;
+        }
+        // candidate's epilogue dst must not be produced between i and j either
+        if (kind == 1) {
+            ggml_tensor * epi = cgraph->nodes[j + 1];
+            for (int k = i + 1; k <= j; ++k) {
+                if (cgraph->nodes[k] == epi) { ready = false; break; }
+            }
+            if (!ready) {
+                continue;
+            }
+        }
+        b.it[b.n++] = it;
+        handled.push_back(j);
+        if (kind == 1) {
+            handled.push_back(j + 1);
+        }
+    }
+
+    if (b.n < 2) {
+        return 0;
+    }
+
+    ggml_cuda_op_rms_norm_batch(cuda_ctx, b, cuda_ctx.stream());
+
+    { // meow(#normbatch): fire statistics
+        static long long nb_batches = 0, nb_items_tot = 0;
+        nb_batches++; nb_items_tot += b.n;
+        if (nb_batches % 256 == 0) {
+            fprintf(stderr, "[normbatch] %lld batches, %.2f items/batch\n", nb_batches, (double) nb_items_tot / nb_batches);
+        }
+    }
+
+    for (int idx : handled) {
+        cgraph->nodes[idx]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+    }
+
+    return (int) handled.size();
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -5075,6 +5222,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // meow(#normbatch): coalesce upcoming independent rms_norm ops into one launch
+                static const int norm_batch_env = []() { const char * e = getenv("GGML_NORM_BATCH"); return e ? atoi(e) : 0; }();
+                if (norm_batch_env > 0 && node->op == GGML_OP_RMS_NORM) {
+                    if (ggml_cuda_try_norm_batch(*cuda_ctx, cgraph, i, norm_batch_env) > 0) {
+                        prev_i = i;
+                        continue;
+                    }
+                }
                 const bool fuse_instr = prof_enabled && (st.evals % prof_every == 0);
                 if (fuse_instr) { // meow: fused groups dispatch inside try_fuse - bracket them with events
                     if ((int) st.ev_start.size() <= i) { st.ev_start.resize(i + 1); st.ev_stop.resize(i + 1); }
