@@ -405,6 +405,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
             return;
         }
     }
+    static const bool gdn_time = getenv("GGML_GDN_TIME") != nullptr; // meow: decode-path self timer
+    hipEvent_t ev0 = nullptr, ev1 = nullptr;
+    if (gdn_time) { hipEventCreate(&ev0); hipEventCreate(&ev1); hipEventRecord(ev0, stream); }
     if (kda) {
         if (keep_rs) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
@@ -425,6 +428,18 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, cache_seq_stride);
         }
+    }
+    if (gdn_time) { // meow: decode-path self timer
+        hipEventRecord(ev1, stream);
+        hipEventSynchronize(ev1);
+        static long long gn = 0; static double gsum = 0;
+        float ms = 0.0f; GGML_UNUSED(ms);
+        hipEventElapsedTime(&ms, ev0, ev1);
+        gsum += ms; gn++;
+        if (gn % 8 == 0) {
+            fprintf(stderr, "[gdn-time] serial kernel: %.3f ms avg (n=%lld) last: n_tokens=%lld H=%lld S_v=%lld\n", gsum/gn, gn, (long long)n_tokens, (long long)H, (long long)S_v);
+        }
+        hipEventDestroy(ev0); hipEventDestroy(ev1);
     }
 }
 

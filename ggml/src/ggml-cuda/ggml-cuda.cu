@@ -5185,6 +5185,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                             (int)(st.ms_name[sn[k].second].second / st.drained));
                                 }
                             }
+                            st.ms.clear(); st.cnt.clear(); st.ms_name.clear(); // meow: per-window stats, not cumulative
                         }
                     }
                     }

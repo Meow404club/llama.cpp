@@ -1628,10 +1628,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (meow_ctx_prof) {
         const int64_t tp1 = ggml_time_us();
-        ctx_prof.t_reuse += (tp1 - tp0)/1000.0;   // params + reuse check + set_inputs + build/alloc path
+        const double dprep = (tp1 - tp0)/1000.0;  // params + reuse check + set_inputs + build/alloc path
+        ctx_prof.t_reuse += dprep;
+        if (ubatch.n_tokens > 2) { ctx_prof.v_reuse += dprep; } // meow: >2 bucket prep (verify/noise evals)
     }
     const int64_t tc0 = meow_ctx_prof ? ggml_time_us() : 0;
+    static const bool gpu_wall = getenv("GGML_CTX_GPU_WALL") != nullptr; // meow: per-eval GPU wall incl. wait
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (meow_ctx_prof && gpu_wall) {
+        synchronize(); // drain the GPU before reading the wall
+        const double dw = (ggml_time_us() - tc0)/1000.0;
+        fprintf(stderr, "[gpu-wall] ctx=%p ntok=%u gtype=%d compute+gpu=%.3f ms\n", (void*)this, ubatch.n_tokens, (int)gtype, dw);
+    }
     if (meow_ctx_prof) {
         const double d = (ggml_time_us() - tc0)/1000.0;
         ctx_prof.t_compute += d;

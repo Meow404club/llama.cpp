@@ -3244,6 +3244,8 @@ private:
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
 // meow: phase profiler - set GGML_SERVER_PHASE_PROF=1 to enable (adds one llama_synchronize per decode)
+#define MEOW_SERVER_PHASE_PROF 1
+const bool meow_phase_prof = getenv("GGML_SERVER_PHASE_PROF") != nullptr;
 #ifdef MEOW_SERVER_PHASE_PROF
 #define DEBUG_TIMINGS 1
 #endif
