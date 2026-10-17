@@ -61,6 +61,10 @@ static __global__ void mul_mat_vec_f(
     const T * gate_x = nullptr;
     const float * x_bias = nullptr;
     const float * gate_bias = nullptr;
+    // meow(#67 port): non-gated activation (+ optional trailing elementwise mul)
+    ggml_unary_op activation = GGML_UNARY_OP_COUNT;
+    bool use_act_mul = false;
+    const float * act_mul = nullptr;
 
     if constexpr (has_fusion) {
         use_gate = fusion.gate != nullptr;
@@ -68,6 +72,8 @@ static __global__ void mul_mat_vec_f(
         use_gate_bias = fusion.gate_bias != nullptr;
         glu_op = fusion.glu_op;
         glu_limit = fusion.glu_limit;
+        activation = fusion.activation;
+        use_act_mul = fusion.activation_mul != nullptr;
 
         if (use_gate) {
             gate_x = static_cast<const T *>(fusion.gate);
@@ -80,6 +86,9 @@ static __global__ void mul_mat_vec_f(
             use_gate_bias = use_gate;
         } else {
             use_gate_bias = false;
+        }
+        if (use_act_mul) {
+            act_mul = static_cast<const float *>(fusion.activation_mul);
         }
     }
 
@@ -94,6 +103,9 @@ static __global__ void mul_mat_vec_f(
         }
         if (use_gate_bias) {
             gate_bias += int64_t(sample_dst)*stride_sample_dst + channel_bias*stride_channel_dst;
+        }
+        if (use_act_mul) {
+            act_mul += int64_t(sample_dst)*stride_sample_dst + channel_bias*stride_channel_dst;
         }
     }
 
@@ -374,13 +386,29 @@ static __global__ void mul_mat_vec_f(
                 default:
                     break;
             }
+        } else {
+            // meow(#67 port): non-gated activation epilogue
+            switch (activation) {
+                case GGML_UNARY_OP_SIGMOID:
+                    value = ggml_cuda_op_sigmoid_single(value);
+                    break;
+                case GGML_UNARY_OP_SILU:
+                    value = ggml_cuda_op_silu_single(value);
+                    break;
+                default:
+                    break;
+            }
+            if (use_act_mul) {
+                value *= act_mul[tid*stride_col_dst + row];
+            }
         }
     }
 
     dst[tid*stride_col_dst + row] = value;
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, glu_limit, gate_x, x_bias, gate_bias, sumf_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, glu_limit, activation, use_act_mul,
+                         gate_x, x_bias, gate_bias, act_mul, sumf_gate);
     }
 }
 
@@ -395,7 +423,8 @@ static void mul_mat_vec_f_switch_fusion(
 
     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                           fusion.activation != GGML_UNARY_OP_COUNT || fusion.activation_mul != nullptr;
     if constexpr (ncols_dst == 1) {
         if (has_fusion) {
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
@@ -450,7 +479,8 @@ void launch_mul_mat_vec_f_cuda(
         }
     }
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                           fusion.activation != GGML_UNARY_OP_COUNT || fusion.activation_mul != nullptr;
 
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
@@ -680,6 +710,13 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+        if (fusion->activation_mul) {
+            GGML_ASSERT(fusion->activation_mul->type == GGML_TYPE_F32);
+            GGML_ASSERT(ggml_is_contiguous(fusion->activation_mul));
+            GGML_ASSERT(ggml_nelements(fusion->activation_mul) == ggml_nelements(dst));
+            fusion_local.activation_mul = fusion->activation_mul->data;
+        }
+        fusion_local.activation = fusion->activation;
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

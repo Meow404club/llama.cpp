@@ -95,6 +95,11 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
+// meow(#67 port): scalar sigmoid for the mmv f/q activation epilogue
+__device__ __forceinline__ float ggml_cuda_op_sigmoid_single(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));
 }

@@ -1605,6 +1605,10 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
+    // meow(#67 port): non-gated unary activation applied to the matmul output (COUNT = none),
+    // optionally followed by a per-row elementwise mul (matmul -> act -> mul)
+    ggml_unary_op activation = GGML_UNARY_OP_COUNT;
+    const ggml_tensor * activation_mul = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1618,6 +1622,8 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    ggml_unary_op activation = GGML_UNARY_OP_COUNT;
+    const void * activation_mul = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {
