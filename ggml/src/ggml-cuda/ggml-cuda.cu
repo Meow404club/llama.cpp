@@ -5173,7 +5173,31 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         st.instr++;
                     }
                 } else {
+                    // meow: CPU-side dispatch profiler - where do the ~0.5ms/node go?
+                    static const bool cpu_prof = getenv("GGML_CUDA_CPUPROF") != nullptr;
+                    const int64_t cp0 = cpu_prof ? ggml_time_us() : 0;
                     ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                    if (cpu_prof) {
+                        // window = 4096 dispatched nodes ~ one 4039-node ubatch graph
+                        static std::unordered_map<ggml_op, std::pair<double, long long>> cpu_ms;
+                        static long long cpu_nodes = 0;
+                        auto & e2 = cpu_ms[node->op];
+                        e2.first += (ggml_time_us() - cp0) / 1000.0;
+                        e2.second += 1;
+                        if (++cpu_nodes % 4096 == 0) {
+                            double tot = 0;
+                            for (auto & kv : cpu_ms) tot += kv.second.first;
+                            fprintf(stderr, "[cpuprof] window %lld (cpu-total %.0f ms):\n", cpu_nodes / 4096, tot);
+                            std::vector<std::pair<double, std::pair<ggml_op, long long>>> v;
+                            for (auto & kv : cpu_ms) v.push_back({kv.second.first, {kv.first, kv.second.second}});
+                            std::sort(v.begin(), v.end(), [](auto & a, auto & b) { return a.first > b.first; });
+                            for (int vi = 0; vi < 12 && vi < (int) v.size(); ++vi) {
+                                fprintf(stderr, "[cpuprof]   %-22s %8.1f ms x %lld\n",
+                                        ggml_op_name(v[vi].second.first), v[vi].first, v[vi].second.second);
+                            }
+                            cpu_ms.clear();
+                        }
+                    }
                 }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));

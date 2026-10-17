@@ -1553,10 +1553,19 @@ static inline void ctx_phase_dump() {
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // meow: apply() timed separately - it can hide a sync waiting on the previous eval
+    static const bool apply_prof = getenv("GGML_CTX_PHASE_PROF") != nullptr;
+    const int64_t ta0 = apply_prof ? ggml_time_us() : 0;
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+    if (apply_prof) {
+        const int64_t t_apply_ms = (ggml_time_us() - ta0) / 1000;
+        if (t_apply_ms > 50) {
+            fprintf(stderr, "[ctx-prof] mctx->apply: %lld ms (ntok=%u)\n", (long long) t_apply_ms, ubatch.n_tokens);
+        }
     }
 
     auto * res = get_gf_res_prev();
@@ -2063,8 +2072,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         ggml_status status;
+        // meow: whole-iteration wall vs process_ubatch internals (prep/compute/apply are
+        // measured separately) - exposes outer-loop + post-processing overhead
+        static const bool meow_ubatch_trace = getenv("GGML_UBATCH_TRACE") != nullptr;
+        const int64_t tu0 = meow_ubatch_trace ? ggml_time_us() : 0;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (meow_ubatch_trace && ubatch.n_tokens > 512) {
+            fprintf(stderr, "[ub-trace] ntok=%u whole=%.1fms\n", ubatch.n_tokens, (ggml_time_us() - tu0) / 1000.0);
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
