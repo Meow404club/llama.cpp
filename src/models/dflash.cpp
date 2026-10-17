@@ -511,8 +511,10 @@ static ggml_tensor * build_dflash2_conv(
     ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,
             coeffs->nb[1], coeffs->nb[3], side * coeffs->nb[2]);
 
-    ggml_tensor * coeff_all = ggml_cont(ctx0, coeffs_side);
-    coeff_all = ggml_reshape_4d(ctx0, coeff_all, 1, n_groups, kernel_size, n_tokens);
+    // meow: repeat on a strided view of the side coefficients directly (the binbcast/repeat
+    // kernels handle arbitrary src strides) instead of materializing a contiguous copy first
+    ggml_tensor * coeff_all = ggml_view_4d(ctx0, coeffs_side, 1, n_groups, kernel_size, n_tokens,
+            coeffs_side->nb[0], coeffs_side->nb[1], coeffs_side->nb[2], 0);
     coeff_all = ggml_repeat_4d(ctx0, coeff_all, group_size, n_groups, kernel_size, n_tokens);
 
     ggml_tensor * base_side = ggml_reshape_4d(ctx0,
@@ -532,17 +534,18 @@ static ggml_tensor * build_dflash2_conv(
                     blocks->nb[1], blocks->nb[2], 0);
             values = ggml_pad_ext(ctx0, previous, 0, 0, tap, 0, 0, 0, 0, 0);
         }
-        values = ggml_reshape_2d(ctx0, values, hidden_size, n_tokens);
+        values = ggml_reshape_4d(ctx0, ggml_reshape_2d(ctx0, values, hidden_size, n_tokens),
+                group_size, n_groups, 1, n_tokens);
 
-        ggml_tensor * weight = ggml_reshape_2d(ctx0,
-                ggml_cont(ctx0, ggml_view_4d(ctx0, weight_all, group_size, n_groups, 1, n_tokens,
-                        weight_all->nb[1], weight_all->nb[2], weight_all->nb[3], tap * weight_all->nb[2])),
-                hidden_size, n_tokens);
+        // meow: elementwise mul on the strided per-tap weight view instead of cont+reshape,
+        // the binary-bcast kernel handles the strides
+        ggml_tensor * weight = ggml_view_4d(ctx0, weight_all, group_size, n_groups, 1, n_tokens,
+                weight_all->nb[1], weight_all->nb[2], weight_all->nb[3], tap * weight_all->nb[2]);
 
         ggml_tensor * term = ggml_mul(ctx0, weight, values);
         result = result ? ggml_add(ctx0, result, term) : term;
     }
-    return result;
+    return ggml_reshape_2d(ctx0, result, hidden_size, n_tokens);
 }
 
 // DFlash2 selector: top-k candidates per block position plus the pairwise

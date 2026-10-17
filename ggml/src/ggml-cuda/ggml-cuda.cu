@@ -2,6 +2,8 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <unordered_set>
+
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -1847,6 +1849,17 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+static int ggml_cuda_fuse_batch_max() {
+    // meow: max dst columns (batch) for which GEMV epilogue fusions are allowed.
+    // 1 = stock behavior; up to MMVQ_MAX_BATCH_SIZE enables fusions in speculative
+    // verify graphs (dflash: M = n_max + 1 = 8).
+    static const int v = []() {
+        const char * e = getenv("GGML_FUSE_BATCH_MAX");
+        return e ? std::max(1, std::min(std::atoi(e), (int) MMVQ_MAX_BATCH_SIZE)) : 1;
+    }();
+    return v;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -1862,7 +1875,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
 
-    //we only support fusion for ncols_dst = 1
+    //we only support fusion for ncols_dst = 1 (meow: mmv_f epilogue is single-row only)
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
         return false;
     }
@@ -1892,8 +1905,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    //we only support fusion for ncols_dst = 1 (meow: relaxed via GGML_FUSE_BATCH_MAX)
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 && dst->ne[1] > (uint64_t) ggml_cuda_fuse_batch_max()) {
         return false;
     }
 
@@ -5051,6 +5064,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    { // meow: one-shot trace of which fusions actually fire
+                        static const bool trace_fuse = (getenv("GGML_CUDA_GRAPH_NAMES") != nullptr);
+                        if (trace_fuse) {
+                            static std::unordered_set<const ggml_tensor *> fused_printed;
+                            if (fused_printed.insert(node).second) {
+                                fprintf(stderr, "[fuse] %4d n=%d", i, cgraph->n_nodes);
+                                for (int fi = 0; fi <= nodes_to_skip; fi++) {
+                                    const ggml_tensor * fn = cgraph->nodes[i + fi];
+                                    fprintf(stderr, " %s", ggml_op_name(fn->op));
+                                }
+                                fprintf(stderr, "  (skipped %d)\n", nodes_to_skip);
+                            }
+                        }
+                    }
                     i += nodes_to_skip;
                     continue;
                 }
@@ -5225,15 +5252,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
-            { // meow: one-shot ordered node dump
+            { // meow: one-shot ordered node dump, once per graph_key
                 static const bool dump_names = (getenv("GGML_CUDA_GRAPH_NAMES") != nullptr);
-                static bool dumped = false;
-                if (dump_names && !dumped) {
-                    dumped = true;
+                static std::unordered_set<const void *> dumped_keys;
+                if (dump_names && dumped_keys.find(graph_key) == dumped_keys.end()) {
+                    dumped_keys.insert(graph_key);
+                    fprintf(stderr, "[nodes] BEGIN key=%p n_nodes=%d\n", graph_key, cgraph->n_nodes);
                     for (int di = 0; di < cgraph->n_nodes; di++) {
                         fprintf(stderr, "[nodes] %4d %-30s %s\n", di, ggml_op_name(cgraph->nodes[di]->op),
                                 cgraph->nodes[di]->name ? cgraph->nodes[di]->name : "?");
                     }
+                    fprintf(stderr, "[nodes] END key=%p\n", graph_key);
                 }
             }
             graph_evaluated_or_captured = true; // CUDA graph has been captured
