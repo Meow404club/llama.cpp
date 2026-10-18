@@ -1277,7 +1277,6 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_GRANITE_SWITCH:
         case LLM_ARCH_EAGLE3:
-        case LLM_ARCH_DFLASH:
         case LLM_ARCH_GEMMA4_ASSISTANT:
             return false;
         default:
