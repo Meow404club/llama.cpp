@@ -3971,9 +3971,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 }
             }
 
-            if (ok_fuse && node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
-                    node->src[0]->nb[0] == sizeof(float)) {
-                ggml_tensor * silu = nullptr;
+                if (ok_fuse && node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
+                        node->src[0]->nb[0] == sizeof(float) && conv->ne[1] > 1) {
+                    // meow: the fused CONCAT+conv+state-update path produces corrupted
+                    // GDN conv outputs at n_t == 1 (bare single-token decode degenerates
+                    // into noise; batch paths and ppl stay correct). Restrict the fusion
+                    // to n_t > 1 - spec verify batches and prefill keep the win, the
+                    // stock CONCAT+CPY+conv path stays bit-correct at M = 1.
+                    ggml_tensor * silu = nullptr;
                 if (conv_idx + 1 < n_nodes && cgraph->nodes[conv_idx + 1]->op == GGML_OP_UNARY &&
                         ggml_get_unary_op(cgraph->nodes[conv_idx + 1]) == GGML_UNARY_OP_SILU &&
                         cgraph->nodes[conv_idx + 1]->src[0] == conv) {
