@@ -2796,10 +2796,12 @@ common_speculative_init_result::common_speculative_init_result(
 
     // meow: full-width block drafts (dflash) materialize the whole compute workspace per
     // physical ubatch - at the target's n_ubatch (e.g. 4096) that is ~2GB per sched slot.
-    // The spec path never evaluates more than one draft block at a time; cap it.
-    // --spec-draft-n-ubatch still overrides with smaller values.
-    if (cparams.n_ubatch > 512) {
-        cparams.n_ubatch = 512;
+    // Decode evaluates at most one draft block (n_max + 1 tokens) at a time and the draft
+    // prefill of long prompts is negligible next to the target's, so a small ubatch costs
+    // nothing while shrinking the draft compute buffer ~4x (497 -> ~150 MiB at 128).
+    // --spec-draft-n-ubatch still overrides with larger values.
+    if (cparams.n_ubatch > 128) {
+        cparams.n_ubatch = 128;
     }
     LOG_INF("%s: draft n_ubatch = %d\n", __func__, (int) cparams.n_ubatch);
 
