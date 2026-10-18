@@ -12,6 +12,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -3228,11 +3229,20 @@ private:
     int64_t t_decode      = 0;
     int64_t t_post_decode = 0;
     int64_t t_sampl       = 0;
+    int64_t t_spec_draft  = 0; // meow: speculative phase profiling
+    int64_t t_spec_accept = 0;
+    int64_t t_step_total  = 0;
+    int64_t n_spec_draft  = 0;
+    int64_t n_spec_accept = 0;
+    int64_t n_step_total  = 0;
+    int64_t t_spec_ckpt   = 0;
+    int64_t t_spec_batch  = 0;
+    int64_t n_spec_ckpt   = 0;
+    int64_t n_spec_batch  = 0;
     int64_t n_pre_decode  = 0;
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
-// #define DEBUG_TIMINGS
 #ifdef DEBUG_TIMINGS
     struct scoped_timer {
         int64_t & t;
@@ -3255,15 +3265,28 @@ private:
 
     void update_slots() {
 #ifdef DEBUG_TIMINGS
+        struct step_timer_t {
+            int64_t & t; int64_t & n; int64_t t0;
+            step_timer_t(int64_t & t_, int64_t & n_) : t(t_), n(n_), t0(ggml_time_us()) {}
+            ~step_timer_t() { t += ggml_time_us() - t0; n++; }
+        };
+        step_timer_t step_tm(t_step_total, n_step_total);
+#endif
+#ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
-        if (t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
+        if (meow_phase_prof && t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
             t_prev = t_start;
             SRV_INF("n_pre_decode      = %" PRId64 "\n", n_pre_decode);
             SRV_INF("avg t_pre_decode  = %f ms\n", (double) t_pre_decode / n_pre_decode / 1000.0);
             SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / n_decode / 1000.0);
             SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / n_post_decode / 1000.0);
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
+            SRV_INF("avg t_spec_draft  = %f ms (x%" PRId64 ")\n", (double) t_spec_draft / (n_spec_draft ? n_spec_draft : 1) / 1000.0, n_spec_draft);
+            SRV_INF("avg t_spec_accept = %f ms (x%" PRId64 ")\n", (double) t_spec_accept / (n_spec_accept ? n_spec_accept : 1) / 1000.0, n_spec_accept);
+            SRV_INF("avg t_step_total  = %f ms (x%" PRId64 ")\n", (double) t_step_total / (n_step_total ? n_step_total : 1) / 1000.0, n_step_total);
+            SRV_INF("avg t_spec_ckpt   = %f ms (x%" PRId64 ")\n", (double) t_spec_ckpt / (n_spec_ckpt ? n_spec_ckpt : 1) / 1000.0, n_spec_ckpt);
+            SRV_INF("avg t_spec_batch  = %f ms (x%" PRId64 ")\n", (double) t_spec_batch / (n_spec_batch ? n_spec_batch : 1) / 1000.0, n_spec_batch);
         }
 #endif
 
@@ -3337,7 +3360,9 @@ private:
                 batch.render(off, n_tokens);
                 bool ok = decode(n_batch, off);
 #ifdef DEBUG_TIMINGS
-                llama_synchronize(ctx_tgt);
+                if (meow_phase_prof) {
+                    llama_synchronize(ctx_tgt);
+                }
 #endif
 
                 if (ok) {
@@ -3511,12 +3536,16 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const int64_t t_spec0 = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            t_spec_draft += ggml_time_us() - t_spec0;
+            n_spec_draft++;
         }
 
         // make checkpoints if needed
+        const int64_t t_ckpt0 = ggml_time_us();
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
@@ -3563,11 +3592,16 @@ private:
                 }
             }
         });
+        t_spec_ckpt += ggml_time_us() - t_ckpt0;
+        n_spec_ckpt++;
 
         // update the batch with the sampled/drafted tokens
+        const int64_t t_batch0 = ggml_time_us();
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
+        t_spec_batch += ggml_time_us() - t_batch0;
+        n_spec_batch++;
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
@@ -4507,6 +4541,8 @@ private:
         });
 
         // speculative decoding - main model sample and accept
+        const int64_t t_acc0 = ggml_time_us();
+        const llama_outputs * outputs = nullptr;
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
                     slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
@@ -4537,10 +4573,15 @@ private:
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
-                } else if (use_rejection) {
-                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                 } else {
-                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    if (!outputs) {
+                        outputs = llama_get_outputs(ctx_tgt);
+                    }
+                    if (use_rejection) {
+                        accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), outputs, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                    } else {
+                        accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), outputs, slot.spec_i_batch, slot.spec_draft);
+                    }
                 }
                 slot.spec_i_batch.clear();
 
@@ -4646,6 +4687,8 @@ private:
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
+        t_spec_accept += ggml_time_us() - t_acc0;
+        n_spec_accept++;
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
