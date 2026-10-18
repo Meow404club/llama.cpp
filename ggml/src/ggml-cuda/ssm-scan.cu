@@ -7,6 +7,11 @@
 using namespace cub;
 #endif // USE_CUB
 
+// meow: hipcub provides the same block-scan primitives for the SSD path below
+#ifdef GGML_USE_HIP
+#include <hipcub/hipcub.hpp>
+#endif
+
 #include "ssm-scan.cuh"
 
 
@@ -362,7 +367,8 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
     }
 }
 
-#if !defined(GGML_USE_HIP)
+// meow: SSD path enabled for HIP (rocblas covers the strided-batched GEMMs)
+#if 1
 // ============================================================================
 // SSD (State Space Duality) kernels for Mamba-2 prefill (n_tok > SSM_SSD_MIN_TOKENS)
 //
@@ -412,8 +418,12 @@ __global__ void ssm_ssd_prepare_dt_kernel(
     // Phase 2+3: per-step inclusive scan to build cs[] in token order.
     // With interleaved distribution the per-thread total scan would not give token-order
     // prefix sums, so we scan one BLOCK_SIZE slab at a time and carry a running total.
-#ifdef USE_CUB
+#if defined(USE_CUB) || defined(GGML_USE_HIP)
+#ifdef GGML_USE_HIP
+    using BlockScan = hipcub::BlockScan<float, BLOCK_SIZE>;
+#else
     using BlockScan = cub::BlockScan<float, BLOCK_SIZE>;
+#endif
     __shared__ typename BlockScan::TempStorage scan_temp;
     __shared__ float step_total;
 
@@ -843,16 +853,20 @@ static void ggml_cuda_op_ssm_scan_impl(ggml_backend_cuda_context & ctx, ggml_ten
     GGML_ASSERT(src5->nb[2] <= (size_t)INT_MAX);
     GGML_ASSERT(src5->nb[3] <= (size_t)INT_MAX);
 
-#if !defined(GGML_USE_HIP)
     // Mamba-2 with scalar A per head: use SSD matmul path for long sequences.
     // Requires NVIDIA Turing+ otherwise fallback to scan.
     const bool is_mamba2 = (src3->nb[1] == sizeof(float));
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+#if defined(GGML_USE_HIP)
+    // meow: rocblas supports every GEMM used by the SSD path
+    const bool cc_ok = true;
+#else
+    const bool cc_ok = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
+#endif
     const bool use_ssd = is_mamba2 && n_t > SSM_SSD_MIN_TOKENS
                       && K == 1
                       && n_t <= SSM_SSD_MAX_TOKENS
-                      && GGML_CUDA_CC_IS_NVIDIA(cc)
-                      && cc >= GGML_CUDA_CC_TURING
+                      && cc_ok
                       && nr % 8 == 0;  // cuBLAS requires 8-element (16-byte) alignment
 
     if (use_ssd) {
@@ -873,7 +887,6 @@ static void ggml_cuda_op_ssm_scan_impl(ggml_backend_cuda_context & ctx, ggml_ten
             cache ? cache->data : (float *) ((char *) dst_d + s_off), nc, nr, nh, ng, n_t, n_s);
         return;
     }
-#endif
     ssm_scan_f32_cuda(src0_d, src1_d, src2_d, src3_d, src4_d, src5_d, src6_d, dst_d,
                       src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3], src2->nb[1], src2->nb[2],
                       src3->nb[1], src4->nb[2], src4->nb[3], src5->nb[2], src5->nb[3],

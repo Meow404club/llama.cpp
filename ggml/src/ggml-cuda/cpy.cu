@@ -624,3 +624,122 @@ void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     ggml_cuda_cpy(ctx, src0, dst);
 }
+
+// meow: batched contiguous same-type copies - the GDN conv-state plumbing emits runs of
+// tiny CPY nodes (9-10 per layer x 48 layers at decode, each a cudaMemcpyAsync of a few KB);
+// coalescing a run into one kernel removes the per-call driver/launch tax.
+static __global__ void cpy_batch_kernel(ggml_cuda_cpy_batch_params2 p) {
+    const int c = blockIdx.x;
+    if (c >= p.n) {
+        return;
+    }
+    const char * GGML_CUDA_RESTRICT s = p.c[c].src;
+    char       * GGML_CUDA_RESTRICT d = p.c[c].dst;
+    const uint32_t w  = p.c[c].width;
+    const uint32_t h  = p.c[c].height;
+    const uint32_t sp = p.c[c].spitch;
+    const uint32_t dp = p.c[c].dpitch;
+
+    // Flatten (row, offset) across the whole block so thin rows stay parallel.
+    if ((((uintptr_t) s) | ((uintptr_t) d) | w | sp | dp) % 4 == 0) {
+        const uint32_t wpr = w / 4; // words per row
+        const uint32_t total = h * wpr;
+        for (uint32_t idx = threadIdx.x; idx < total; idx += blockDim.x) {
+            const uint32_t row = idx / wpr;
+            const uint32_t off = (idx % wpr) * 4;
+            *(uint32_t *) (d + (size_t) row * dp + off) = *(const uint32_t *) (s + (size_t) row * sp + off);
+        }
+    } else {
+        const uint32_t total = h * w;
+        for (uint32_t idx = threadIdx.x; idx < total; idx += blockDim.x) {
+            const uint32_t row = idx / w;
+            const uint32_t off = idx % w;
+            d[(size_t) row * dp + off] = s[(size_t) row * sp + off];
+        }
+    }
+}
+
+// meow: extract a 2D-pitched copy shape; the two sides may have different pitches as long
+// as they share (width, height) in logical row-major order. A fully contiguous side adopts
+// the other side's shape with pitch == width. Returns false when dim0 is strided or the
+// sides do not decompose compatibly (e.g. transposes).
+static bool meow_cpy_decompose2d(const ggml_tensor * t, uint32_t & width, uint32_t & height, uint32_t & pitch, bool & fully_contig) {
+    const size_t ts = ggml_element_size(t);
+    if (t->nb[0] != ts) {
+        return false;
+    }
+    size_t block = ts;
+    int dim = 0;
+    for (; dim < GGML_MAX_DIMS; ++dim) {
+        if (t->nb[dim] != block) {
+            break;
+        }
+        block *= t->ne[dim];
+    }
+    if (dim == 0) {
+        return false;
+    }
+    for (int k = dim + 1; k < GGML_MAX_DIMS; ++k) {
+        if (t->ne[k] != 1) {
+            return false;
+        }
+    }
+    fully_contig = (dim == GGML_MAX_DIMS);
+    if (!fully_contig) {
+        width  = (uint32_t) block;
+        height = (uint32_t) t->ne[dim];
+        pitch  = (uint32_t) t->nb[dim];
+        return pitch >= width;
+    }
+    return true;
+}
+
+bool ggml_cuda_cpy_batch_chunk_of(const ggml_tensor * s, const ggml_tensor * d, ggml_cuda_cpy_batch_chunk & c) {
+    if (s->type != d->type || ggml_nelements(s) == 0 || ggml_nelements(s) != ggml_nelements(d)) {
+        return false;
+    }
+    uint32_t w1 = 0, h1 = 0, p1 = 0, w2 = 0, h2 = 0, p2 = 0;
+    bool fc1 = false, fc2 = false;
+    if (!meow_cpy_decompose2d(s, w1, h1, p1, fc1) || !meow_cpy_decompose2d(d, w2, h2, p2, fc2)) {
+        return false;
+    }
+    if (fc1 && fc2) {
+        const uint32_t total = (uint32_t) ggml_nbytes(s);
+        w1 = w2 = total;
+        h1 = h2 = 1;
+        p1 = p2 = total;
+    } else if (fc1) {
+        w1 = w2; h1 = h2; p1 = w2;
+    } else if (fc2) {
+        w2 = w1; h2 = h1; p2 = w1;
+    }
+    if (w1 != w2 || h1 != h2 || w1 == 0 || h1 == 0) {
+        return false;
+    }
+    // cap the chunk so one block copies at most ~64MB
+    if ((uint64_t) h1 * p1 > (1ull << 26) || (uint64_t) h1 * p2 > (1ull << 26)) {
+        return false;
+    }
+    c.src    = (const char *) s->data;
+    c.dst    = (char *) d->data;
+    c.width  = w1;
+    c.height = h1;
+    c.spitch = p1;
+    c.dpitch = p2;
+    return true;
+}
+
+void ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n) {
+    static_assert(MEOW_CPY_BATCH_MAX <= 16, "param struct stays under the kernel arg budget");
+    ggml_cuda_cpy_batch_params2 p;
+    p.n = n;
+    for (int k = 0; k < n; k++) {
+        bool ok = ggml_cuda_cpy_batch_chunk_of(nodes[k]->src[0], nodes[k]->src[1], p.c[k]);
+        GGML_ASSERT(ok);
+    }
+
+    const dim3 block(256);
+    const dim3 grid(n);
+    cpy_batch_kernel<<<grid, block, 0, ctx.stream()>>>(p);
+    CUDA_CHECK(cudaGetLastError());
+}
