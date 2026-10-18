@@ -2794,6 +2794,15 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
+    // meow: full-width block drafts (dflash) materialize the whole compute workspace per
+    // physical ubatch - at the target's n_ubatch (e.g. 4096) that is ~2GB per sched slot.
+    // The spec path never evaluates more than one draft block at a time; cap it.
+    // --spec-draft-n-ubatch still overrides with smaller values.
+    if (cparams.n_ubatch > 512) {
+        cparams.n_ubatch = 512;
+    }
+    LOG_INF("%s: draft n_ubatch = %d\n", __func__, (int) cparams.n_ubatch);
+
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
