@@ -105,6 +105,10 @@ if (GGML_HIP_NO_VMM)
     add_compile_definitions(GGML_HIP_NO_VMM)
 endif()
 
+if (GGML_HIP_ROCWMMA_FATTN)
+    add_compile_definitions(GGML_HIP_ROCWMMA_FATTN)
+endif()
+
 if (NOT GGML_HIP_MMQ_MFMA)
     add_compile_definitions(GGML_HIP_NO_MMQ_MFMA)
 endif()
@@ -123,6 +127,10 @@ endif()
 
 if (CXX_IS_HIPCC)
     set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE CXX)
+    # per-file HIP mode + arch (global CXX flags would poison the link step with -x)
+    if (AMDGPU_TARGETS)
+        set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES COMPILE_FLAGS "-x hip --offload-arch=${AMDGPU_TARGETS}")
+    endif()
     if (WIN32 AND CMAKE_BUILD_TYPE STREQUAL "Debug")
         # CMake on Windows doesn't support the HIP language yet.
         # Therefore we workaround debug build's failure on HIP backend this way.
