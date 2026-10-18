@@ -4,6 +4,8 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <mutex>
+#include <unordered_map>
 #include <type_traits>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
@@ -422,6 +424,44 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= 5;
             default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
+    // meow: on RDNA3 the WMMA MMQ kernels (#17576) beat MMVQ once the batch
+    // redoes enough per-column dequant work. Seeded A/B on gfx1100 (RX 7900 XT,
+    // IQ3_S 27B + Q4_K_M dflash2 draft): routing batch >= 4 to MMQ cuts the
+    // spec-decode step 77.0 -> 66.7 ms (+13%); the draft-side Q4_K switch alone
+    // is worth ~9 t/s; batch 1-2 stays MMVQ (tied with MMQ there).
+    // Restricted to quants MMQ supports - anything else must fall through to
+    // the stock path so it still reaches cuBLAS instead of an unsupported kernel.
+    if (GGML_CUDA_CC_IS_RDNA3(cc)) {
+        switch (type) {
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q3_K:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_IQ2_XXS:
+            case GGML_TYPE_IQ2_XS:
+            case GGML_TYPE_IQ2_S:
+            case GGML_TYPE_IQ3_XXS:
+            case GGML_TYPE_IQ3_S:
+            case GGML_TYPE_IQ4_XS:
+            case GGML_TYPE_IQ4_NL:
+                return ne11 <= 3;
+            default:
+                break;
+        }
+    }
+    // meow: env override for tuning the mmvq->mmq crossover (AMD RDNA3, see #29820).
+    // GGML_CUDA_MMVQ_MAX=N allows MMVQ only for ne11 <= N; negative/absent = stock behavior.
+    {
+        static const int env_max = []() {
+            const char * e = getenv("GGML_CUDA_MMVQ_MAX");
+            return e ? atoi(e) : -1;
+        }();
+        if (env_max >= 0) {
+            return ne11 <= env_max;
         }
     }
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
@@ -1055,18 +1095,16 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-    if constexpr (c_ncols_dst == 1) {
-        if (has_fusion) {
-            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
-                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-            return;
-        }
+    // meow(#67 ext): the kernel epilogue handles any ncols_dst (per-row bias/act arrays),
+    // so launch the fused template for all batch sizes, not just ncols_dst == 1
+    if (has_fusion) {
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+        ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
+             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+             channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+        return;
     }
-
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
@@ -1483,7 +1521,9 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        // meow(#67 ext): the kernel epilogue is ncols_dst-aware (per-row bias/act arrays);
+        // allow multi-row fusion up to the template instantiation limit
+        GGML_ASSERT(  ids || dst->ne[1] <= (int64_t) MMVQ_MAX_BATCH_SIZE);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
