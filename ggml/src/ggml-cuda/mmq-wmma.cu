@@ -1467,6 +1467,12 @@ void ggml_cuda_mul_mat_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor *
 }
 
 bool ggml_cuda_should_use_wmma(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int cc, const int64_t ne11) {
+    // meow: escape hatch for A/B. Since the blas_min_m=512 routing landed in should_use_mmq,
+    // dequant(Q4_K->f16)+hipBLASLt reaches ~86 TF effective on real data while this fused
+    // kernel tops out at ~72 TF (probe, wmma_dq_bench); the Q4_K route here predates that
+    // measurement. GGML_MEOW_WMMA_OFF=1 sends everything to the cublas path.
+    static const bool meow_off = getenv("GGML_MEOW_WMMA_OFF") != nullptr;
+    if (meow_off) return false;
     if (!GGML_CUDA_CC_IS_RDNA3(cc)) return false;
     if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_IQ3_S) return false;
     if (src1->type != GGML_TYPE_F32 || src1->nb[0] != sizeof(float)) return false;
@@ -1479,7 +1485,12 @@ bool ggml_cuda_should_use_wmma(const ggml_tensor * src0, const ggml_tensor * src
         return false;
     }
     // v4 Q4_K dq path only; IQ3_S stays on dp4a (the v1 big kernel loses to it).
-    return src0->type == GGML_TYPE_Q4_K;
+    // meow: above ~512 rows the dequant->f16 + hipBLASLt path wins - its ~86 TF effective
+    // (real-data measured in-graph; the 93-104 numbers from a memset-pattern bench are
+    // delta-compression artifacts) beats this kernel's ~72 TF ceiling: 8K prefill
+    // benchmark 856 -> 884 t/s (+3.2%). Below 512 the alternative is dp4a MMQ at
+    // ~62-68 TF, so keep v4 for the mid range.
+    return src0->type == GGML_TYPE_Q4_K && ne11 < 512;
 }
 
 #else // non-HIP fallback stubs
