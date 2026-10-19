@@ -1458,6 +1458,182 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
+#if defined(GGML_USE_HIP) && defined(_WIN32)
+// meow: direct hipblasLt TN with runtime solution tuning --------------------------------
+// rocblas->hipblaslt delegation always lands on heuristic solution #0 (~93 TF on the
+// model's prefill shapes), while the best of the first ~12 heuristic solutions reaches
+// 100-104 TF (blaslt_bench sweep). The TUNING_OVERRIDE_FILE route is blocked by the
+// "Git Version" match, so instead: first call per (M,N,K) times each solution on the
+// live stream (3 iters) and caches the fastest one. GGML_MEOW_LT_TUNE=1 to enable.
+// Layout: D_col[N x M] = op(A_col[K x N])^T * B_col[K x M], f16 x f16 -> f32 direct.
+#define NOMINMAX
+#include <windows.h>
+
+namespace meow_lt {
+
+enum : int { LT_OP_N = 111, LT_OP_T = 112 };
+enum : int { LT_R_32F = 0, LT_R_16F = 2 };
+enum : int { LT_COMPUTE_16F = 0 };   // HIPBLAS_COMPUTE_16F per hipblas-common.h - the f32-C class is ~30% slower on gfx1100
+enum : int { LT_DESC_TRANSA = 0, LT_DESC_TRANSB = 1 };
+enum : int { LT_PREF_MAX_WORKSPACE_BYTES = 1 };
+
+typedef struct _hipblasLtHandle *             ltHandle;
+typedef struct _hipblasLtMatmulDesc *         ltMatmulDesc;
+typedef struct _hipblasLtMatrixLayout *       ltLayout;
+typedef struct _hipblasLtMatmulPreference *   ltPref;
+// ABI mirror of hipblaslt.h: algo carries data[16] + size_t max_workspace_bytes (24 B),
+// heuristic result is 56 B total. A wrong size here smashes the stack from GetHeuristic.
+struct ltAlgo { unsigned char data[16]; size_t max_workspace_bytes; };
+struct ltHeur {
+    ltAlgo  algo;
+    size_t  workspaceSize;
+    int     state;
+    float   wavesCount;
+    int     reserved[4];
+};
+static_assert(sizeof(ltAlgo) == 24, "hipblasLtMatmulAlgo_t ABI");
+static_assert(sizeof(ltHeur) == 56, "hipblasLtMatmulHeuristicResult_t ABI");
+
+typedef int (*ltCreate_fn)(ltHandle *);
+typedef int (*ltDescCreate_fn)(ltMatmulDesc *, int /*compute*/, int /*scaleType*/);
+typedef int (*ltDescSetAttr_fn)(ltMatmulDesc, int, const void *, size_t);
+typedef int (*ltLayoutCreate_fn)(ltLayout *, int /*type*/, unsigned long long rows, unsigned long long cols, long long ld);
+typedef int (*ltPrefCreate_fn)(ltPref *);
+typedef int (*ltPrefSetAttr_fn)(ltPref, int, const void *, size_t);
+typedef int (*ltGetHeuristic_fn)(ltHandle, ltMatmulDesc, ltLayout, ltLayout, ltLayout, ltLayout, ltPref, int, ltHeur *, int *);
+typedef int (*ltMatmul_fn)(ltHandle, ltMatmulDesc, const void *, const void *, ltLayout,
+                           const void *, ltLayout, const void *, const void *, ltLayout,
+                           const void *, ltLayout, const ltAlgo *, void *, size_t, cudaStream_t);
+
+struct ltPlan {
+    ltMatmulDesc desc = nullptr;
+    ltLayout     A = nullptr, B = nullptr, C = nullptr;
+    ltAlgo       algo;
+    size_t       ws_size = 0;
+};
+
+static ltCreate_fn      fn_create;
+static ltDescCreate_fn  fn_descCreate;
+static ltDescSetAttr_fn fn_descSetAttr;
+static ltLayoutCreate_fn fn_layoutCreate;
+static ltPrefCreate_fn  fn_prefCreate;
+static ltPrefSetAttr_fn fn_prefSetAttr;
+static ltGetHeuristic_fn fn_getHeuristic;
+static ltMatmul_fn      fn_matmul;
+static ltHandle         g_handle = nullptr;
+static ltPref           g_pref = nullptr;
+static bool             g_tried = false, g_ok = false;
+static std::unordered_map<uint64_t, ltPlan> g_plans;
+
+static bool init() {
+    if (g_tried) { return g_ok; }
+    g_tried = true;
+    if (getenv("GGML_MEOW_LT_TUNE") == nullptr) { return false; }
+    HMODULE m = LoadLibraryA("libhipblaslt.dll");
+    if (!m) { m = LoadLibraryA("hipblaslt.dll"); }
+    if (!m) { fprintf(stderr, "[lt-tune] libhipblaslt.dll not found\n"); return false; }
+    #define LT_LOAD(var, sym) \
+        var = (decltype(var)) GetProcAddress(m, sym); \
+        if (!var) { fprintf(stderr, "[lt-tune] missing symbol %s\n", sym); return false; }
+    LT_LOAD(fn_create,        "hipblasLtCreate")
+    LT_LOAD(fn_descCreate,    "hipblasLtMatmulDescCreate")
+    LT_LOAD(fn_descSetAttr,   "hipblasLtMatmulDescSetAttribute")
+    LT_LOAD(fn_layoutCreate,  "hipblasLtMatrixLayoutCreate")
+    LT_LOAD(fn_prefCreate,    "hipblasLtMatmulPreferenceCreate")
+    LT_LOAD(fn_prefSetAttr,   "hipblasLtMatmulPreferenceSetAttribute")
+    LT_LOAD(fn_getHeuristic,  "hipblasLtMatmulAlgoGetHeuristic")
+    LT_LOAD(fn_matmul,        "hipblasLtMatmul")
+    #undef LT_LOAD
+    if (fn_create(&g_handle) != 0) { fprintf(stderr, "[lt-tune] create failed\n"); return false; }
+    if (fn_prefCreate(&g_pref) != 0) { return false; }
+    unsigned long long ws = 128ull << 20;
+    fn_prefSetAttr(g_pref, LT_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws));
+    g_ok = true;
+    fprintf(stderr, "[lt-tune] loaded, direct TN + per-shape solution tuning active\n");
+    return true;
+}
+
+static bool matmul(ggml_backend_cuda_context & ctx, const void * A, const void * B, float * D,
+                   int64_t M, int64_t N, int64_t K, int64_t lda, int64_t ldb, int64_t ldd,
+                   cudaStream_t stream) {
+    if (!init()) { return false; }
+    // f16 compute + f16 D into a pool temp, then one convert to f32 (matches the
+    // rocblas delegation config; the f32-C solution class is ~30% slower on gfx1100).
+    ggml_cuda_pool_alloc<half> dst16(ctx.pool());
+    half * D16 = dst16.alloc((size_t) M * N);
+    const half alpha_h = __float2half(1.0f), beta_h = __float2half(0.0f);
+    const uint64_t key = ((uint64_t) K << 42) ^ ((uint64_t) N << 21) ^ (uint64_t) M;
+    auto it = g_plans.find(key);
+    if (it == g_plans.end()) {
+        ltPlan p;
+        if (fn_descCreate(&p.desc, LT_COMPUTE_16F, LT_R_16F) != 0) { return false; }
+        const int32_t opT = LT_OP_T, opN = LT_OP_N;
+        fn_descSetAttr(p.desc, LT_DESC_TRANSA, &opT, sizeof(opT));
+        fn_descSetAttr(p.desc, LT_DESC_TRANSB, &opN, sizeof(opN));
+        if (fn_layoutCreate(&p.A, LT_R_16F, K, N, lda) != 0 ||
+            fn_layoutCreate(&p.B, LT_R_16F, K, M, ldb) != 0 ||
+            fn_layoutCreate(&p.C, LT_R_16F, N, M, ldd) != 0) {
+            return false;
+        }
+        ltHeur h[48];
+        int cnt = 0;
+        if (fn_getHeuristic(g_handle, p.desc, p.A, p.B, p.C, p.C, g_pref, 48, h, &cnt) != 0 || cnt < 1) {
+            static int misses = 0;
+            if (misses++ < 3) { fprintf(stderr, "[lt-tune] no heuristic for %lldx%lldx%lld\n", (long long) M, (long long) N, (long long) K); }
+            return false;
+        }
+        // time each solution on the live stream; the winner is cached and re-run below
+        // so D16 ends up carrying the winner's output.
+        ggml_cuda_pool_alloc<char> ws(ctx.pool());
+        size_t max_ws = 0;
+        for (int s = 0; s < cnt; ++s) { max_ws = std::max(max_ws, h[s].workspaceSize); }
+        if (max_ws > 0) { ws.alloc(max_ws); }
+        cudaEvent_t ev0, ev1;
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev0, 0));   // flags=0: timing enabled
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev1, 0));
+        int best = 0;
+        float best_ms = 1e30f;
+        for (int s = 0; s < cnt; ++s) {
+            fn_matmul(g_handle, p.desc, &alpha_h, A, p.A, B, p.B, &beta_h, D16, p.C, D16, p.C,
+                      &h[s].algo, ws.get(), h[s].workspaceSize, stream);   // warmup
+            cudaEventRecord(ev0, stream);
+            for (int r = 0; r < 3; ++r) {
+                fn_matmul(g_handle, p.desc, &alpha_h, A, p.A, B, p.B, &beta_h, D16, p.C, D16, p.C,
+                          &h[s].algo, ws.get(), h[s].workspaceSize, stream);
+            }
+            cudaEventRecord(ev1, stream);
+            cudaEventSynchronize(ev1);
+            float ms = 0;
+            hipEventElapsedTime(&ms, ev0, ev1);
+            if (ms < best_ms) { best_ms = ms; best = s; }
+        }
+        cudaEventDestroy(ev0); cudaEventDestroy(ev1);
+        p.algo    = h[best].algo;
+        p.ws_size = h[best].workspaceSize;
+        fprintf(stderr, "[lt-tune] %lldx%lldx%lld: solution %d/%d wins (%.3f ms/iter)\n",
+                (long long) M, (long long) N, (long long) K, best, cnt, best_ms / 3.0f);
+        // final run with the winner so D16 carries the winning solution's output
+        fn_matmul(g_handle, p.desc, &alpha_h, A, p.A, B, p.B, &beta_h, D16, p.C, D16, p.C,
+                  &p.algo, ws.get(), p.ws_size, stream);
+        const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+        to_fp32_cuda(D16, D, (size_t) M * N, stream);
+        it = g_plans.emplace(key, p).first;
+        return true;
+    }
+    const ltPlan & p = it->second;
+    ggml_cuda_pool_alloc<char> ws(ctx.pool());
+    if (p.ws_size > 0) { ws.alloc(p.ws_size); }
+    const int st = fn_matmul(g_handle, p.desc, &alpha_h, A, p.A, B, p.B, &beta_h, D16, p.C, D16, p.C,
+                             &p.algo, ws.get(), p.ws_size, stream);
+    if (st != 0) { return false; }
+    const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+    to_fp32_cuda(D16, D, (size_t) M * N, stream);
+    return true;
+}
+
+} // namespace meow_lt
+#endif // GGML_USE_HIP && _WIN32
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -1585,6 +1761,19 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
     GGML_ASSERT(ne12 % ne02 == 0);
     GGML_ASSERT(ne13 % ne03 == 0);
+
+#if defined(GGML_USE_HIP) && defined(_WIN32)
+    // meow: direct hipblasLt TN with per-shape solution tuning - see meow_lt above.
+    // Single contiguous matrix, f16 inputs: D_col[N x M] = A_col[K x N]^T * B_col[K x M].
+    if (compute_type == GGML_TYPE_F16 && ne12 == 1 && ne13 == 1 && ne02 == 1 && ne03 == 1 &&
+            dst->ne[2] == 1 && dst->ne[3] == 1 &&
+            s01 == ne00 && s11 == ne10 &&
+            nb0 == sizeof(float) && nb1 == (size_t) ne01*sizeof(float)) {
+        if (meow_lt::matmul(ctx, src0_ptr, src1_ptr, dst_ddf, ne11, ne01, ne10, s01, s11, ne01, main_stream)) {
+            return;
+        }
+    }
+#endif
 
     // broadcast factors
     const int64_t r2 = ne12/ne02;
