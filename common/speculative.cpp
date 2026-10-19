@@ -1148,10 +1148,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
 
         // meow(#merge): fused inject+noise eval - numerically bit-exact with the two-pass
-        // flow (greedy SHA + acceptance verified identical), but the single merged graph
-        // costs ~+3.5 ms more host/launch than the two smaller evals save in boundary, so
-        // it nets ~+2 ms/step. Opt-in only (LLAMA_DFLASH_MERGE=1) until that is understood.
-        merge_eval = false;
+        // flow (greedy SHA + acceptance verified identical). Initially measured ~+2 ms/step
+        // slower and kept opt-in; that verdict predates the draft n_ubatch cap of 128
+        // (2d28c6f4a) - at n_ubatch 512 the merged graph's shape alternation forced expensive
+        // reschedules, at 128 the rebuild is ~1.2 ms and the saved eval boundary dominates
+        // (process() 8.4 -> 3.0 ms/cycle, net -2 ms/step). Default on for dflash2;
+        // LLAMA_DFLASH_MERGE=0 restores the two-pass flow.
+        merge_eval = is_dflash2 && !is_lilicorr;
         if (const char * env = getenv("LLAMA_DFLASH_MERGE")) {
             merge_eval = is_dflash2 && !is_lilicorr && std::atoi(env) != 0;
         }
