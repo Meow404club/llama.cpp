@@ -1442,7 +1442,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
-        const auto * outputs = llama_get_outputs(ctx_dft);
+        // meow: the dflash2 path only reads the selector lattice from embeddings_nextn -
+        // llama_get_outputs() would additionally construct the per-row sampling views and
+        // reorder every output buffer for the whole context, wasted work in the steady
+        // decode loop. Fetch the one buffer directly (the accessor synchronizes); the
+        // other draft flavors still go through the full accessor.
+        float * embd_nextn_dft = nullptr;
+        const bool lattice_only = is_dflash2 && !is_lilicorr;
+        if (lattice_only) {
+            embd_nextn_dft = llama_get_embeddings_nextn(ctx_dft);
+        }
+        const auto * outputs = lattice_only ? nullptr : llama_get_outputs(ctx_dft);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
@@ -1460,7 +1470,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (is_dflash2 || is_lilicorr) {
                 // Both DFlash and LiliCorr greedily walk the candidate lattice.
                 // meow(#30196): read the lattice from the already-synced outputs instead of a second sync.
-                const float * lattice = outputs->embeddings_nextn;
+                const float * lattice = is_dflash2 ? embd_nextn_dft : outputs->embeddings_nextn;
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
                 int32_t predecessor = 0;

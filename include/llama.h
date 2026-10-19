@@ -1168,6 +1168,12 @@ extern "C" {
     // otherwise: float[n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
 
+    // meow: get the nextn/draft-lattice embeddings without the full llama_get_outputs()
+    // view construction (per-row sampling views + reorder of every output buffer) - the
+    // wrapper synchronizes, so the returned buffer is safe to read. Only meaningful when
+    // the context was created with llama_set_embeddings_nextn(ctx, true, ...).
+    LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config
